@@ -6673,6 +6673,11 @@ void dump_vmcs(struct kvm_vcpu *vcpu)
  */
 static int __vmx_handle_exit(struct kvm_vcpu *vcpu, fastpath_t exit_fastpath)
 {
+	unsigned long long rdtsc_ret, rdtsc_ret2;
+	unsigned eax, edx;
+	__asm__ volatile("rdtsc" : "=a" (eax), "=d" (edx));
+	rdtsc_ret = ((unsigned long long)eax) | (((unsigned long long)edx) << 32);
+
 	struct vcpu_vmx *vmx = to_vmx(vcpu);
 	union vmx_exit_reason exit_reason = vmx_get_exit_reason(vcpu);
 	u32 vectoring_info = vmx->idt_vectoring_info;
@@ -6687,15 +6692,22 @@ static int __vmx_handle_exit(struct kvm_vcpu *vcpu, fastpath_t exit_fastpath)
 			u8 buf[16];
 			int ret;
 			struct x86_exception e;
+
 			unsigned long rip = vmcs_readl(GUEST_RIP);
 			ret = kvm_read_guest_virt(vcpu, rip, buf, sizeof(buf), &e);
-			if (ret != X86EMUL_CONTINUE) {
+
+			if (unlikely(ret != X86EMUL_CONTINUE)) {
 				return 0;
 			}
-			
-			if (buf[0] == 0x62) {
-				trace_kvm_ud_exit(vcpu, rip, buf);
+
+			if (likely(buf[0] == 0x62)) {
 				kvm_rip_write(vcpu, vmcs_readl(GUEST_RIP) + 6);
+
+				__asm__ volatile("rdtsc" : "=a" (eax), "=d" (edx));
+				rdtsc_ret2 = ((unsigned long long)eax) | (((unsigned long long)edx) << 32);
+				unsigned long long delta_vmexit = rdtsc_ret2 - rdtsc_ret;
+
+				trace_kvm_ud_exit(vcpu, rip, buf, delta_vmexit);
 				return 1;
 			}
 		}

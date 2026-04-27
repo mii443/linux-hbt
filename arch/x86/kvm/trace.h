@@ -476,25 +476,28 @@ TRACE_EVENT(kvm_vmx_handle_exit,
  * Tracepoint for kvm #UD exit
  */
 TRACE_EVENT(kvm_ud_exit,
-	TP_PROTO(struct kvm_vcpu *vcpu, unsigned long guest_rip, u8 *guest_inst),
-	TP_ARGS(vcpu, guest_rip, guest_inst),
+	TP_PROTO(struct kvm_vcpu *vcpu, unsigned long guest_rip, u8 *guest_inst, unsigned long long vmexit_tsc),
+	TP_ARGS(vcpu, guest_rip, guest_inst, vmexit_tsc),
 
 	TP_STRUCT__entry(
 		__field(	unsigned int,	vcpu_id		)
 		__field(	unsigned long,	guest_rip	)
+		__field(	unsigned long long, vmexit_tsc	)
 		__array(	u8,		guest_inst, 16	)
 	),
 
 	TP_fast_assign(
 		__entry->vcpu_id        = vcpu->vcpu_id;
 		__entry->guest_rip      = guest_rip;
+		__entry->vmexit_tsc = vmexit_tsc;
 		memcpy(__entry->guest_inst, guest_inst, sizeof(__entry->guest_inst));
 	),
 
-	TP_printk("vcpu %u rip 0x%lx inst %s",
+	TP_printk("vcpu %u rip 0x%lx inst %s vmexit_tsc %llu",
 		  __entry->vcpu_id,
 		  __entry->guest_rip,
-		  __print_hex(__entry->guest_inst, sizeof(__entry->guest_inst)))
+		  __print_hex(__entry->guest_inst, sizeof(__entry->guest_inst)),
+		  __entry->vmexit_tsc)
 );
 
 /*
