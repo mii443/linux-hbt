@@ -433,6 +433,70 @@ TRACE_EVENT(name,							     \
  */
 TRACE_EVENT_KVM_EXIT(kvm_exit);
 
+#define kvm_trace_exit_fastpath					\
+	{ EXIT_FASTPATH_NONE,		"none" },		\
+	{ EXIT_FASTPATH_REENTER_GUEST,	"reenter_guest" },	\
+	{ EXIT_FASTPATH_EXIT_HANDLED,	"exit_handled" },	\
+	{ EXIT_FASTPATH_EXIT_USERSPACE,	"exit_userspace" }
+
+/*
+ * Tracepoint for VMX's main exit handler.
+ */
+TRACE_EVENT(kvm_vmx_handle_exit,
+	TP_PROTO(struct kvm_vcpu *vcpu, u32 exit_reason, unsigned int exit_fastpath, u32 vector),
+	TP_ARGS(vcpu, exit_reason, exit_fastpath, vector),
+
+	TP_STRUCT__entry(
+		__field(	unsigned int,	vcpu_id		)
+		__field(	u32,		exit_reason	)
+		__field(	unsigned long,	guest_rip	)
+		__field(	unsigned int,	exit_fastpath	)
+		__field(	u64,		requests	)
+		__field(	u32,		vector		)
+	),
+
+	TP_fast_assign(
+		__entry->vcpu_id	= vcpu->vcpu_id;
+		__entry->exit_reason	= exit_reason;
+		__entry->guest_rip	= tracing_kvm_rip_read(vcpu);
+		__entry->exit_fastpath	= exit_fastpath;
+		__entry->requests	= READ_ONCE(vcpu->requests);
+		__entry->vector		= vector;
+	),
+
+	TP_printk("vcpu %u reason %s%s%s rip 0x%lx fastpath %s requests 0x%016llx",
+		  __entry->vcpu_id,
+		  kvm_print_exit_reason(__entry->exit_reason, KVM_ISA_VMX),
+		  __entry->guest_rip,
+		  __print_symbolic(__entry->exit_fastpath, kvm_trace_exit_fastpath),
+		  __entry->requests)
+);
+
+/*
+ * Tracepoint for kvm #UD exit
+ */
+TRACE_EVENT(kvm_ud_exit,
+	TP_PROTO(struct kvm_vcpu *vcpu, unsigned long guest_rip, u8 *guest_inst),
+	TP_ARGS(vcpu, guest_rip, guest_inst),
+
+	TP_STRUCT__entry(
+		__field(	unsigned int,	vcpu_id		)
+		__field(	unsigned long,	guest_rip	)
+		__array(	u8,		guest_inst, 16	)
+	),
+
+	TP_fast_assign(
+		__entry->vcpu_id        = vcpu->vcpu_id;
+		__entry->guest_rip      = guest_rip;
+		memcpy(__entry->guest_inst, guest_inst, sizeof(__entry->guest_inst));
+	),
+
+	TP_printk("vcpu %u rip 0x%lx inst %s",
+		  __entry->vcpu_id,
+		  __entry->guest_rip,
+		  __print_hex(__entry->guest_inst, sizeof(__entry->guest_inst)))
+);
+
 /*
  * Tracepoint for kvm interrupt injection:
  */

@@ -950,6 +950,8 @@ void vmx_update_exception_bitmap(struct kvm_vcpu *vcpu)
 	if (vcpu->arch.xfd_no_write_intercept)
 		eb |= (1u << NM_VECTOR);
 
+	eb |= (1u << UD_VECTOR);
+
 	vmcs_write32(EXCEPTION_BITMAP, eb);
 }
 
@@ -6675,6 +6677,31 @@ static int __vmx_handle_exit(struct kvm_vcpu *vcpu, fastpath_t exit_fastpath)
 	union vmx_exit_reason exit_reason = vmx_get_exit_reason(vcpu);
 	u32 vectoring_info = vmx->idt_vectoring_info;
 	u16 exit_handler_index;
+	u32 vector = 0;
+
+	if (exit_reason.basic == EXIT_REASON_EXCEPTION_NMI) {
+		u32 intr_info = vmx_get_intr_info(vcpu);
+		vector = intr_info & INTR_INFO_VECTOR_MASK;
+
+		if (vector == UD_VECTOR) {
+			u8 buf[16];
+			int ret;
+			struct x86_exception e;
+			unsigned long rip = vmcs_readl(GUEST_RIP);
+			ret = kvm_read_guest_virt(vcpu, rip, buf, sizeof(buf), &e);
+			if (ret != X86EMUL_CONTINUE) {
+				return 0;
+			}
+			
+			if (buf[0] == 0x62) {
+				trace_kvm_ud_exit(vcpu, rip, buf);
+				kvm_rip_write(vcpu, vmcs_readl(GUEST_RIP) + 6);
+				return 1;
+			}
+		}
+	}
+
+	trace_kvm_vmx_handle_exit(vcpu, exit_reason.full, exit_fastpath, vector);
 
 	/*
 	 * Flush logged GPAs PML buffer, this will make dirty_bitmap more
