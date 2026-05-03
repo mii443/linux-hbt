@@ -2198,6 +2198,10 @@ u64 vcpu_tsc_khz(struct kvm_vcpu *vcpu);
  *                          an instruction if it could generate a given software
  *                          interrupt, which must be encoded via
  *                          EMULTYPE_SET_SOFT_INT_VECTOR().
+ *
+ * EMULTYPE_XOM_WRITE_IGNORE - Set when emulating a write fault to execute-only
+ *			       memory.  Writes to XOM guest memory are ignored
+ *			       while the instruction is otherwise emulated.
  */
 #define EMULTYPE_NO_DECODE	    (1 << 0)
 #define EMULTYPE_TRAP_UD	    (1 << 1)
@@ -2209,6 +2213,7 @@ u64 vcpu_tsc_khz(struct kvm_vcpu *vcpu);
 #define EMULTYPE_COMPLETE_USER_EXIT (1 << 7)
 #define EMULTYPE_WRITE_PF_TO_SP	    (1 << 8)
 #define EMULTYPE_SKIP_SOFT_INT	    (1 << 9)
+#define EMULTYPE_XOM_WRITE_IGNORE   (1 << 10)
 
 #define EMULTYPE_SET_SOFT_INT_VECTOR(v)	((u32)((v) & 0xff) << 16)
 #define EMULTYPE_GET_SOFT_INT_VECTOR(e)	(((e) >> 16) & 0xff)

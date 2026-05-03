@@ -1171,6 +1171,7 @@ static int tdp_mmu_map_handle_target_level(struct kvm_vcpu *vcpu,
 {
 	struct kvm_mmu_page *sp = sptep_to_sp(rcu_dereference(iter->sptep));
 	u64 new_spte;
+	unsigned int access;
 	int ret = RET_PF_FIXED;
 	bool wrprot = false;
 
@@ -1186,10 +1187,12 @@ static int tdp_mmu_map_handle_target_level(struct kvm_vcpu *vcpu,
 
 	if (unlikely(!fault->slot))
 		new_spte = make_mmio_spte(vcpu, iter->gfn, ACC_ALL);
-	else
-		wrprot = make_spte(vcpu, sp, fault->slot, ACC_ALL, iter->gfn,
+	else {
+		access = kvm_mmu_maybe_xom_access(vcpu->kvm, iter->gfn, ACC_ALL);
+		wrprot = make_spte(vcpu, sp, fault->slot, access, iter->gfn,
 				   fault->pfn, iter->old_spte, fault->prefetch,
 				   false, fault->map_writable, &new_spte);
+	}
 
 	if (new_spte == iter->old_spte)
 		ret = RET_PF_SPURIOUS;

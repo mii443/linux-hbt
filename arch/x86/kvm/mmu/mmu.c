@@ -3085,6 +3085,8 @@ static int mmu_set_spte(struct kvm_vcpu *vcpu, struct kvm_memory_slot *slot,
 		return RET_PF_EMULATE;
 	}
 
+	pte_access = kvm_mmu_maybe_xom_access(vcpu->kvm, gfn, pte_access);
+
 	wrprot = make_spte(vcpu, sp, slot, pte_access, gfn, pfn, *sptep, prefetch,
 			   false, host_writable, &spte);
 
@@ -3112,6 +3114,16 @@ static int mmu_set_spte(struct kvm_vcpu *vcpu, struct kvm_memory_slot *slot,
 	return ret;
 }
 
+static bool kvm_gfn_range_has_xom(struct kvm *kvm, gfn_t start, gfn_t end)
+{
+	unsigned long index = start;
+
+	if (start >= end)
+		return false;
+
+	return xa_find(&kvm->arch.xom.gfns, &index, end - 1, XA_PRESENT);
+}
+
 static bool kvm_mmu_prefetch_sptes(struct kvm_vcpu *vcpu, gfn_t gfn, u64 *sptep,
 				   int nr_pages, unsigned int access)
 {
@@ -3131,6 +3143,11 @@ static bool kvm_mmu_prefetch_sptes(struct kvm_vcpu *vcpu, gfn_t gfn, u64 *sptep,
 		return false;
 
 	for (i = 0; i < nr_pages; i++, gfn++, sptep++) {
+		if (kvm_is_gfn_xom(vcpu->kvm, gfn) && !(access & ACC_EXEC_MASK)) {
+			kvm_release_page_clean(pages[i]);
+			continue;
+		}
+
 		mmu_set_spte(vcpu, slot, sptep, access, gfn,
 			     page_to_pfn(pages[i]), NULL);
 
@@ -3390,6 +3407,8 @@ void kvm_mmu_hugepage_adjust(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault
 {
 	struct kvm_memory_slot *slot = fault->slot;
 	kvm_pfn_t mask;
+	gfn_t base, end;
+	u8 level;
 
 	fault->huge_page_disallowed = fault->exec && fault->nx_huge_page_workaround_enabled;
 
@@ -3411,11 +3430,21 @@ void kvm_mmu_hugepage_adjust(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault
 	if (fault->req_level == PG_LEVEL_4K || fault->huge_page_disallowed)
 		return;
 
+	for (level = fault->req_level; level > PG_LEVEL_4K; level--) {
+		mask = KVM_PAGES_PER_HPAGE(level) - 1;
+		base = fault->gfn & ~mask;
+		end = base + KVM_PAGES_PER_HPAGE(level);
+		if (!kvm_gfn_range_has_xom(vcpu->kvm, base, end))
+			break;
+	}
+	if (level == PG_LEVEL_4K)
+		return;
+
 	/*
 	 * mmu_invalidate_retry() was successful and mmu_lock is held, so
 	 * the pmd can't be split from under us.
 	 */
-	fault->goal_level = fault->req_level;
+	fault->goal_level = level;
 	mask = KVM_PAGES_PER_HPAGE(fault->goal_level) - 1;
 	VM_BUG_ON((fault->gfn & mask) != (fault->pfn & mask));
 	fault->pfn &= ~mask;
@@ -4811,6 +4840,9 @@ static int direct_page_fault(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault
 	if (page_fault_handle_page_track(vcpu, fault))
 		return RET_PF_WRITE_PROTECTED;
 
+	if (kvm_mmu_is_xom_fault(vcpu, fault))
+		return RET_PF_EMULATE;
+
 	r = fast_page_fault(vcpu, fault);
 	if (r != RET_PF_INVALID)
 		return r;
@@ -4901,6 +4933,9 @@ static int kvm_tdp_mmu_page_fault(struct kvm_vcpu *vcpu,
 
 	if (page_fault_handle_page_track(vcpu, fault))
 		return RET_PF_WRITE_PROTECTED;
+
+	if (kvm_mmu_is_xom_fault(vcpu, fault))
+		return RET_PF_EMULATE;
 
 	r = fast_page_fault(vcpu, fault);
 	if (r != RET_PF_INVALID)
@@ -8144,7 +8179,7 @@ EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_is_gfn_xom);
 
 unsigned int kvm_mmu_maybe_xom_access(struct kvm *kvm, gfn_t gfn, unsigned int access)
 {
-	if (kvm_is_gfn_xom(kvm, gfn) && (access && ACC_EXEC_MASK))
+	if (kvm_is_gfn_xom(kvm, gfn) && (access & ACC_EXEC_MASK))
 		return ACC_EXEC_MASK;
 
 	return access;

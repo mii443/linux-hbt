@@ -7984,6 +7984,14 @@ static int emulator_read_std(struct x86_emulate_ctxt *ctxt,
 	return kvm_read_guest_virt_helper(addr, val, bytes, vcpu, access, exception);
 }
 
+static bool emulator_should_ignore_xom_write(struct kvm_vcpu *vcpu, gpa_t gpa)
+{
+	struct x86_emulate_ctxt *ctxt = vcpu->arch.emulate_ctxt;
+	gfn_t gfn = gpa_to_gfn(gpa) & ~kvm_gfn_direct_bits(vcpu->kvm);
+
+	return ctxt->ignore_xom_writes && kvm_is_gfn_xom(vcpu->kvm, gfn);
+}
+
 static int kvm_write_guest_virt_helper(gva_t addr, void *val, unsigned int bytes,
 				      struct kvm_vcpu *vcpu, u64 access,
 				      struct x86_exception *exception)
@@ -8000,12 +8008,16 @@ static int kvm_write_guest_virt_helper(gva_t addr, void *val, unsigned int bytes
 
 		if (gpa == INVALID_GPA)
 			return X86EMUL_PROPAGATE_FAULT;
+		if (emulator_should_ignore_xom_write(vcpu, gpa))
+			goto done;
+
 		ret = kvm_vcpu_write_guest(vcpu, gpa, data, towrite);
 		if (ret < 0) {
 			r = X86EMUL_IO_NEEDED;
 			goto out;
 		}
 
+done:
 		bytes -= towrite;
 		data += towrite;
 		addr += towrite;
@@ -8138,6 +8150,9 @@ static int emulator_write_guest(struct kvm_vcpu *vcpu, gpa_t gpa,
 				void *val, int bytes)
 {
 	int ret;
+
+	if (emulator_should_ignore_xom_write(vcpu, gpa))
+		return 1;
 
 	ret = kvm_vcpu_write_guest(vcpu, gpa, val, bytes);
 	if (ret < 0)
@@ -8355,6 +8370,8 @@ static int emulator_cmpxchg_emulated(struct x86_emulate_ctxt *ctxt,
 	if (gpa == INVALID_GPA ||
 	    (gpa & PAGE_MASK) == APIC_DEFAULT_PHYS_BASE)
 		goto emul_write;
+	if (emulator_should_ignore_xom_write(vcpu, gpa))
+		return X86EMUL_CONTINUE;
 
 	/*
 	 * Emulate the atomic as a straight write to avoid #AC if SLD is
@@ -9456,6 +9473,8 @@ int x86_emulate_instruction(struct kvm_vcpu *vcpu, gpa_t cr2_or_gpa,
 	    (WARN_ON_ONCE(is_guest_mode(vcpu)) ||
 	     WARN_ON_ONCE(!(emulation_type & EMULTYPE_PF))))
 		emulation_type &= ~EMULTYPE_ALLOW_RETRY_PF;
+
+	ctxt->ignore_xom_writes = emulation_type & EMULTYPE_XOM_WRITE_IGNORE;
 
 	r = kvm_check_emulate_insn(vcpu, emulation_type, insn, insn_len);
 	if (r != X86EMUL_CONTINUE) {
@@ -13349,9 +13368,11 @@ int kvm_arch_init_vm(struct kvm *kvm, unsigned long type)
 		type == KVM_X86_DEFAULT_VM || type == KVM_X86_SW_PROTECTED_VM;
 	kvm->arch.disabled_quirks = kvm_caps.inapplicable_quirks & kvm_caps.supported_quirks;
 
+	kvm_xom_init(kvm);
+
 	ret = kvm_page_track_init(kvm);
 	if (ret)
-		goto out;
+		goto out_destroy_xom;
 
 	ret = kvm_mmu_init_vm(kvm);
 	if (ret)
@@ -13400,7 +13421,8 @@ out_uninit_mmu:
 	kvm_mmu_uninit_vm(kvm);
 out_cleanup_page_track:
 	kvm_page_track_cleanup(kvm);
-out:
+out_destroy_xom:
+	kvm_xom_destroy(kvm);
 	return ret;
 }
 
@@ -13524,6 +13546,7 @@ void kvm_arch_destroy_vm(struct kvm *kvm)
 	kfree(srcu_dereference_check(kvm->arch.pmu_event_filter, &kvm->srcu, 1));
 	kvm_mmu_uninit_vm(kvm);
 	kvm_page_track_cleanup(kvm);
+	kvm_xom_destroy(kvm);
 	kvm_xen_destroy_vm(kvm);
 	kvm_hv_destroy_vm(kvm);
 	kvm_x86_call(vm_destroy)(kvm);
