@@ -1666,6 +1666,10 @@ struct kvm_arch {
 	 * current VM.
 	 */
 	int cpu_dirty_log_size;
+
+	struct {
+		struct xarray gfns;
+	} xom;
 };
 
 struct kvm_vm_stat {

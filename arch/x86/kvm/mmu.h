@@ -83,6 +83,12 @@ void kvm_mmu_set_mmio_spte_value(struct kvm *kvm, u64 mmio_value);
 void kvm_mmu_set_me_spte_mask(u64 me_value, u64 me_mask);
 void kvm_mmu_set_ept_masks(bool has_ad_bits, bool has_exec_only);
 
+void kvm_xom_init(struct kvm *kvm);
+void kvm_xom_destroy(struct kvm *kvm);
+int kvm_mark_gfn_xom(struct kvm *kvm, gfn_t gfn);
+bool kvm_is_gfn_xom(struct kvm *kvm, gfn_t gfn);
+unsigned int kvm_mmu_maybe_xom_access(struct kvm *kvm, gfn_t gfn, unsigned int access);
+
 void kvm_init_mmu(struct kvm_vcpu *vcpu);
 void kvm_init_shadow_npt_mmu(struct kvm_vcpu *vcpu, unsigned long cr0,
 			     unsigned long cr4, u64 efer, gpa_t nested_cr3);

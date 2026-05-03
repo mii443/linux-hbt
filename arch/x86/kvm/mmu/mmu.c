@@ -8109,3 +8109,43 @@ void kvm_mmu_init_memslot_memory_attributes(struct kvm *kvm,
 	}
 }
 #endif
+
+void kvm_xom_init(struct kvm *kvm)
+{
+	xa_init(&kvm->arch.xom.gfns);
+}
+
+void kvm_xom_destroy(struct kvm *kvm)
+{
+	xa_destroy(&kvm->arch.xom.gfns);
+}
+
+int kvm_mark_gfn_xom(struct kvm *kvm, gfn_t gfn)
+{
+	void *entry;
+
+	if (gfn > kvm_mmu_max_gfn())
+		return -EINVAL;
+
+	entry = xa_store(&kvm->arch.xom.gfns, gfn, xa_mk_value(1), GFP_KERNEL);
+	if (xa_is_err(entry))
+		return xa_err(entry);
+
+	kvm_zap_gfn_range(kvm, gfn, gfn + 1);
+	return 0;
+}
+EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_mark_gfn_xom);
+
+bool kvm_is_gfn_xom(struct kvm *kvm, gfn_t gfn)
+{
+	return xa_load(&kvm->arch.xom.gfns, gfn);
+}
+EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_is_gfn_xom);
+
+unsigned int kvm_mmu_maybe_xom_access(struct kvm *kvm, gfn_t gfn, unsigned int access)
+{
+	if (kvm_is_gfn_xom(kvm, gfn) && (access && ACC_EXEC_MASK))
+		return ACC_EXEC_MASK;
+
+	return access;
+}
