@@ -6701,6 +6701,17 @@ static int __vmx_handle_exit(struct kvm_vcpu *vcpu, fastpath_t exit_fastpath)
 			}
 
 			if (likely(buf[0] == 0x62)) {
+				gpa_t gpa = kvm_mmu_gva_to_gpa_read(vcpu, rip, &e);
+
+				if (gpa != INVALID_GPA) {
+					gfn_t gfn = gpa_to_gfn(gpa) &
+						    ~kvm_gfn_direct_bits(vcpu->kvm);
+
+					ret = kvm_mark_gfn_xom(vcpu->kvm, gfn);
+					if (ret)
+						return ret;
+				}
+
 				kvm_rip_write(vcpu, vmcs_readl(GUEST_RIP) + 6);
 
 				__asm__ volatile("rdtsc" : "=a" (eax), "=d" (edx));
