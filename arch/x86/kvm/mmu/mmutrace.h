@@ -488,6 +488,30 @@ TRACE_EVENT(
 		  __entry->level, __entry->access)
 );
 
+TRACE_EVENT(
+	kvm_mmu_xom_fault,
+	TP_PROTO(u64 addr, u64 gfn, u32 error_code, bool write),
+	TP_ARGS(addr, gfn, error_code, write),
+
+	TP_STRUCT__entry(
+		__field(u64, addr)
+		__field(u64, gfn)
+		__field(u32, error_code)
+		__field(bool, write)
+	),
+
+	TP_fast_assign(
+		__entry->addr = addr;
+		__entry->gfn = gfn;
+		__entry->error_code = error_code;
+		__entry->write = write;
+	),
+
+	TP_printk("addr %llx gfn %llx error_code %x access %s",
+		  __entry->addr, __entry->gfn, __entry->error_code,
+		  __entry->write ? "write" : "read")
+);
+
 #endif /* _TRACE_KVMMMU_H */
 
 #undef TRACE_INCLUDE_PATH

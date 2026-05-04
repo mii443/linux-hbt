@@ -4846,8 +4846,11 @@ static int direct_page_fault(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault
 	if (page_fault_handle_page_track(vcpu, fault))
 		return RET_PF_WRITE_PROTECTED;
 
-	if (kvm_mmu_is_xom_fault(vcpu, fault))
+	if (kvm_mmu_is_xom_fault(vcpu, fault)) {
+		trace_kvm_mmu_xom_fault(fault->addr, fault->gfn,
+					fault->error_code, fault->write);
 		return RET_PF_EMULATE;
+	}
 
 	r = fast_page_fault(vcpu, fault);
 	if (r != RET_PF_INVALID)
@@ -4940,8 +4943,11 @@ static int kvm_tdp_mmu_page_fault(struct kvm_vcpu *vcpu,
 	if (page_fault_handle_page_track(vcpu, fault))
 		return RET_PF_WRITE_PROTECTED;
 
-	if (kvm_mmu_is_xom_fault(vcpu, fault))
+	if (kvm_mmu_is_xom_fault(vcpu, fault)) {
+		trace_kvm_mmu_xom_fault(fault->addr, fault->gfn,
+					fault->error_code, fault->write);
 		return RET_PF_EMULATE;
+	}
 
 	r = fast_page_fault(vcpu, fault);
 	if (r != RET_PF_INVALID)

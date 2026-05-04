@@ -791,8 +791,11 @@ static int FNAME(page_fault)(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault
 	fault->max_level = walker.level;
 	fault->slot = kvm_vcpu_gfn_to_memslot(vcpu, fault->gfn);
 
-	if (kvm_mmu_is_xom_fault(vcpu, fault))
+	if (kvm_mmu_is_xom_fault(vcpu, fault)) {
+		trace_kvm_mmu_xom_fault(fault->addr, fault->gfn,
+					fault->error_code, fault->write);
 		return RET_PF_EMULATE;
+	}
 
 	if (page_fault_handle_page_track(vcpu, fault)) {
 		shadow_page_table_clear_flood(vcpu, fault->addr);
