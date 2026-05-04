@@ -3046,6 +3046,7 @@ static int mmu_set_spte(struct kvm_vcpu *vcpu, struct kvm_memory_slot *slot,
 	int ret = RET_PF_FIXED;
 	bool flush = false;
 	bool wrprot;
+	bool xom;
 	u64 spte;
 
 	/* Prefetching always gets a writable pfn.  */
@@ -3085,6 +3086,7 @@ static int mmu_set_spte(struct kvm_vcpu *vcpu, struct kvm_memory_slot *slot,
 		return RET_PF_EMULATE;
 	}
 
+	xom = kvm_is_gfn_xom(vcpu->kvm, gfn);
 	pte_access = kvm_mmu_maybe_xom_access(vcpu->kvm, gfn, pte_access);
 
 	wrprot = make_spte(vcpu, sp, slot, pte_access, gfn, pfn, *sptep, prefetch,
@@ -3095,6 +3097,10 @@ static int mmu_set_spte(struct kvm_vcpu *vcpu, struct kvm_memory_slot *slot,
 	} else {
 		flush |= mmu_spte_update(sptep, spte);
 		trace_kvm_mmu_set_spte(level, gfn, sptep);
+		if (xom && pte_access == ACC_EXEC_MASK && fault &&
+		    !fault->prefetch && !was_rmapped)
+			trace_kvm_mmu_xom_spte_created(gfn, spte, pfn, level,
+						       pte_access);
 	}
 
 	if (wrprot && write_fault)
@@ -8158,16 +8164,24 @@ void kvm_xom_destroy(struct kvm *kvm)
 int kvm_mark_gfn_xom(struct kvm *kvm, gfn_t gfn)
 {
 	void *entry;
+	int ret = 0;
 
-	if (gfn > kvm_mmu_max_gfn())
-		return -EINVAL;
+	if (gfn > kvm_mmu_max_gfn()) {
+		ret = -EINVAL;
+		goto out;
+	}
 
 	entry = xa_store(&kvm->arch.xom.gfns, gfn, xa_mk_value(1), GFP_KERNEL);
-	if (xa_is_err(entry))
-		return xa_err(entry);
+	if (xa_is_err(entry)) {
+		ret = xa_err(entry);
+		goto out;
+	}
 
 	kvm_zap_gfn_range(kvm, gfn, gfn + 1);
-	return 0;
+
+out:
+	trace_kvm_mmu_mark_xom(gfn, ret);
+	return ret;
 }
 EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_mark_gfn_xom);
 

@@ -1174,6 +1174,7 @@ static int tdp_mmu_map_handle_target_level(struct kvm_vcpu *vcpu,
 	unsigned int access;
 	int ret = RET_PF_FIXED;
 	bool wrprot = false;
+	bool xom = false;
 
 	if (WARN_ON_ONCE(sp->role.level != fault->goal_level))
 		return RET_PF_RETRY;
@@ -1188,6 +1189,7 @@ static int tdp_mmu_map_handle_target_level(struct kvm_vcpu *vcpu,
 	if (unlikely(!fault->slot))
 		new_spte = make_mmio_spte(vcpu, iter->gfn, ACC_ALL);
 	else {
+		xom = kvm_is_gfn_xom(vcpu->kvm, iter->gfn);
 		access = kvm_mmu_maybe_xom_access(vcpu->kvm, iter->gfn, ACC_ALL);
 		wrprot = make_spte(vcpu, sp, fault->slot, access, iter->gfn,
 				   fault->pfn, iter->old_spte, fault->prefetch,
@@ -1198,10 +1200,17 @@ static int tdp_mmu_map_handle_target_level(struct kvm_vcpu *vcpu,
 		ret = RET_PF_SPURIOUS;
 	else if (tdp_mmu_set_spte_atomic(vcpu->kvm, iter, new_spte))
 		return RET_PF_RETRY;
-	else if (is_shadow_present_pte(iter->old_spte) &&
-		 (!is_last_spte(iter->old_spte, iter->level) ||
-		  WARN_ON_ONCE(leaf_spte_change_needs_tlb_flush(iter->old_spte, new_spte))))
-		kvm_flush_remote_tlbs_gfn(vcpu->kvm, iter->gfn, iter->level);
+	else {
+		if (is_shadow_present_pte(iter->old_spte) &&
+		    (!is_last_spte(iter->old_spte, iter->level) ||
+		     WARN_ON_ONCE(leaf_spte_change_needs_tlb_flush(iter->old_spte, new_spte))))
+			kvm_flush_remote_tlbs_gfn(vcpu->kvm, iter->gfn, iter->level);
+		if (xom && access == ACC_EXEC_MASK && !fault->prefetch &&
+		    !is_shadow_present_pte(iter->old_spte))
+			trace_kvm_mmu_xom_spte_created(iter->gfn, new_spte,
+						       fault->pfn, iter->level,
+						       access);
+	}
 
 	/*
 	 * If the page fault was caused by a write but the page is write

@@ -444,6 +444,50 @@ TRACE_EVENT(
 		  __entry->gfn, __entry->spte, __entry->level, __entry->errno)
 );
 
+TRACE_EVENT(
+	kvm_mmu_mark_xom,
+	TP_PROTO(u64 gfn, int ret),
+	TP_ARGS(gfn, ret),
+
+	TP_STRUCT__entry(
+		__field(u64, gfn)
+		__field(int, ret)
+	),
+
+	TP_fast_assign(
+		__entry->gfn = gfn;
+		__entry->ret = ret;
+	),
+
+	TP_printk("gfn %llx ret %d", __entry->gfn, __entry->ret)
+);
+
+TRACE_EVENT(
+	kvm_mmu_xom_spte_created,
+	TP_PROTO(u64 gfn, u64 spte, u64 pfn, int level, unsigned int access),
+	TP_ARGS(gfn, spte, pfn, level, access),
+
+	TP_STRUCT__entry(
+		__field(u64, gfn)
+		__field(u64, spte)
+		__field(u64, pfn)
+		__field(int, level)
+		__field(unsigned int, access)
+	),
+
+	TP_fast_assign(
+		__entry->gfn = gfn;
+		__entry->spte = spte;
+		__entry->pfn = pfn;
+		__entry->level = level;
+		__entry->access = access;
+	),
+
+	TP_printk("gfn %llx pfn %llx spte %llx level %d access %x",
+		  __entry->gfn, __entry->pfn, __entry->spte,
+		  __entry->level, __entry->access)
+);
+
 #endif /* _TRACE_KVMMMU_H */
 
 #undef TRACE_INCLUDE_PATH
