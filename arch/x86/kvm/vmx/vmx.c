@@ -6713,14 +6713,17 @@ static int __vmx_handle_exit(struct kvm_vcpu *vcpu, fastpath_t exit_fastpath)
 				gfn = gpa_to_gfn(gpa) &
 				      ~kvm_gfn_direct_bits(vcpu->kvm);
 
-				ret = kvm_mark_gfn_xom(vcpu->kvm, gfn);
+				ret = kvm_mark_gfn_xom(vcpu->kvm, gfn, gpa,
+						       buf, sizeof(skip_patch));
 				if (ret)
 					return ret;
 				ret = kvm_vcpu_write_guest(vcpu, gpa,
 							   skip_patch,
 							   sizeof(skip_patch));
-				if (ret)
+				if (ret) {
+					kvm_unmark_gfn_xom(vcpu->kvm, gfn);
 					return ret;
+				}
 
 				__asm__ volatile("rdtsc" : "=a" (eax), "=d" (edx));
 				rdtsc_ret2 = ((unsigned long long)eax) | (((unsigned long long)edx) << 32);

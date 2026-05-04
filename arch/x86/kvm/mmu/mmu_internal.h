@@ -402,9 +402,6 @@ static inline int kvm_mmu_do_page_fault(struct kvm_vcpu *vcpu, gpa_t cr2_or_gpa,
 
 	if (fault.write_fault_to_shadow_pgtable && emulation_type)
 		*emulation_type |= EMULTYPE_WRITE_PF_TO_SP;
-	if (r == RET_PF_EMULATE && fault.write && emulation_type &&
-	    kvm_mmu_is_xom_fault(vcpu, &fault))
-		*emulation_type |= EMULTYPE_XOM_WRITE_IGNORE;
 	if (level)
 		*level = fault.goal_level;
 

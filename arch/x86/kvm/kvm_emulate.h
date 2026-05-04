@@ -352,8 +352,6 @@ struct x86_emulate_ctxt {
 	bool gpa_available;
 	gpa_t gpa_val;
 
-	bool ignore_xom_writes;
-
 	/*
 	 * decode cache
 	 */

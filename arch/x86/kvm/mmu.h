@@ -85,7 +85,9 @@ void kvm_mmu_set_ept_masks(bool has_ad_bits, bool has_exec_only);
 
 void kvm_xom_init(struct kvm *kvm);
 void kvm_xom_destroy(struct kvm *kvm);
-int kvm_mark_gfn_xom(struct kvm *kvm, gfn_t gfn);
+int kvm_mark_gfn_xom(struct kvm *kvm, gfn_t gfn, gpa_t patch_gpa,
+		     const u8 *original, u8 len);
+int kvm_unmark_gfn_xom(struct kvm *kvm, gfn_t gfn);
 bool kvm_is_gfn_xom(struct kvm *kvm, gfn_t gfn);
 unsigned int kvm_mmu_maybe_xom_access(struct kvm *kvm, gfn_t gfn, unsigned int access);
 

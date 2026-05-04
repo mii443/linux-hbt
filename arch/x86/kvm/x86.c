@@ -7984,14 +7984,6 @@ static int emulator_read_std(struct x86_emulate_ctxt *ctxt,
 	return kvm_read_guest_virt_helper(addr, val, bytes, vcpu, access, exception);
 }
 
-static bool emulator_should_ignore_xom_write(struct kvm_vcpu *vcpu, gpa_t gpa)
-{
-	struct x86_emulate_ctxt *ctxt = vcpu->arch.emulate_ctxt;
-	gfn_t gfn = gpa_to_gfn(gpa) & ~kvm_gfn_direct_bits(vcpu->kvm);
-
-	return ctxt->ignore_xom_writes && kvm_is_gfn_xom(vcpu->kvm, gfn);
-}
-
 static int kvm_write_guest_virt_helper(gva_t addr, void *val, unsigned int bytes,
 				      struct kvm_vcpu *vcpu, u64 access,
 				      struct x86_exception *exception)
@@ -8008,8 +8000,6 @@ static int kvm_write_guest_virt_helper(gva_t addr, void *val, unsigned int bytes
 
 		if (gpa == INVALID_GPA)
 			return X86EMUL_PROPAGATE_FAULT;
-		if (emulator_should_ignore_xom_write(vcpu, gpa))
-			goto done;
 
 		ret = kvm_vcpu_write_guest(vcpu, gpa, data, towrite);
 		if (ret < 0) {
@@ -8017,7 +8007,6 @@ static int kvm_write_guest_virt_helper(gva_t addr, void *val, unsigned int bytes
 			goto out;
 		}
 
-done:
 		bytes -= towrite;
 		data += towrite;
 		addr += towrite;
@@ -8150,9 +8139,6 @@ static int emulator_write_guest(struct kvm_vcpu *vcpu, gpa_t gpa,
 				void *val, int bytes)
 {
 	int ret;
-
-	if (emulator_should_ignore_xom_write(vcpu, gpa))
-		return 1;
 
 	ret = kvm_vcpu_write_guest(vcpu, gpa, val, bytes);
 	if (ret < 0)
@@ -8370,8 +8356,6 @@ static int emulator_cmpxchg_emulated(struct x86_emulate_ctxt *ctxt,
 	if (gpa == INVALID_GPA ||
 	    (gpa & PAGE_MASK) == APIC_DEFAULT_PHYS_BASE)
 		goto emul_write;
-	if (emulator_should_ignore_xom_write(vcpu, gpa))
-		return X86EMUL_CONTINUE;
 
 	/*
 	 * Emulate the atomic as a straight write to avoid #AC if SLD is
@@ -9473,8 +9457,6 @@ int x86_emulate_instruction(struct kvm_vcpu *vcpu, gpa_t cr2_or_gpa,
 	    (WARN_ON_ONCE(is_guest_mode(vcpu)) ||
 	     WARN_ON_ONCE(!(emulation_type & EMULTYPE_PF))))
 		emulation_type &= ~EMULTYPE_ALLOW_RETRY_PF;
-
-	ctxt->ignore_xom_writes = emulation_type & EMULTYPE_XOM_WRITE_IGNORE;
 
 	r = kvm_check_emulate_insn(vcpu, emulation_type, insn, insn_len);
 	if (r != X86EMUL_CONTINUE) {

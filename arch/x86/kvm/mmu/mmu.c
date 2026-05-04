@@ -4835,6 +4835,21 @@ static bool is_page_fault_stale(struct kvm_vcpu *vcpu,
 	       mmu_invalidate_retry_gfn(vcpu->kvm, fault->mmu_seq, fault->gfn);
 }
 
+static int kvm_mmu_handle_xom_fault(struct kvm_vcpu *vcpu,
+				    struct kvm_page_fault *fault)
+{
+	int r;
+
+	trace_kvm_mmu_xom_fault(fault->addr, fault->gfn,
+				fault->error_code, fault->write);
+
+	if (!fault->write)
+		return RET_PF_EMULATE;
+
+	r = kvm_unmark_gfn_xom(vcpu->kvm, fault->gfn);
+	return r ? r : RET_PF_RETRY;
+}
+
 static int direct_page_fault(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault)
 {
 	int r;
@@ -4846,11 +4861,8 @@ static int direct_page_fault(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault
 	if (page_fault_handle_page_track(vcpu, fault))
 		return RET_PF_WRITE_PROTECTED;
 
-	if (kvm_mmu_is_xom_fault(vcpu, fault)) {
-		trace_kvm_mmu_xom_fault(fault->addr, fault->gfn,
-					fault->error_code, fault->write);
-		return RET_PF_EMULATE;
-	}
+	if (kvm_mmu_is_xom_fault(vcpu, fault))
+		return kvm_mmu_handle_xom_fault(vcpu, fault);
 
 	r = fast_page_fault(vcpu, fault);
 	if (r != RET_PF_INVALID)
@@ -4943,11 +4955,8 @@ static int kvm_tdp_mmu_page_fault(struct kvm_vcpu *vcpu,
 	if (page_fault_handle_page_track(vcpu, fault))
 		return RET_PF_WRITE_PROTECTED;
 
-	if (kvm_mmu_is_xom_fault(vcpu, fault)) {
-		trace_kvm_mmu_xom_fault(fault->addr, fault->gfn,
-					fault->error_code, fault->write);
-		return RET_PF_EMULATE;
-	}
+	if (kvm_mmu_is_xom_fault(vcpu, fault))
+		return kvm_mmu_handle_xom_fault(vcpu, fault);
 
 	r = fast_page_fault(vcpu, fault);
 	if (r != RET_PF_INVALID)
@@ -8157,31 +8166,103 @@ void kvm_mmu_init_memslot_memory_attributes(struct kvm *kvm,
 }
 #endif
 
+#define KVM_XOM_MAX_PATCH_LEN 16
+
+struct kvm_xom_patch {
+	struct list_head node;
+	gpa_t gpa;
+	u8 len;
+	u8 original[KVM_XOM_MAX_PATCH_LEN];
+};
+
+struct kvm_xom_entry {
+	struct list_head patches;
+};
+
 void kvm_xom_init(struct kvm *kvm)
 {
 	xa_init(&kvm->arch.xom.gfns);
+	mutex_init(&kvm->arch.xom.lock);
 }
 
 void kvm_xom_destroy(struct kvm *kvm)
 {
+	struct kvm_xom_entry *entry;
+	unsigned long index;
+
+	xa_for_each(&kvm->arch.xom.gfns, index, entry) {
+		struct kvm_xom_patch *patch, *tmp;
+
+		list_for_each_entry_safe(patch, tmp, &entry->patches, node) {
+			list_del(&patch->node);
+			kfree(patch);
+		}
+		kfree(entry);
+	}
+
 	xa_destroy(&kvm->arch.xom.gfns);
 }
 
-int kvm_mark_gfn_xom(struct kvm *kvm, gfn_t gfn)
+int kvm_mark_gfn_xom(struct kvm *kvm, gfn_t gfn, gpa_t patch_gpa,
+		     const u8 *original, u8 len)
 {
-	void *entry;
+	struct kvm_xom_entry *entry, *new_entry = NULL;
+	struct kvm_xom_patch *patch, *tmp;
 	int ret = 0;
 
 	if (gfn > kvm_mmu_max_gfn()) {
 		ret = -EINVAL;
 		goto out;
 	}
-
-	entry = xa_store(&kvm->arch.xom.gfns, gfn, xa_mk_value(1), GFP_KERNEL);
-	if (xa_is_err(entry)) {
-		ret = xa_err(entry);
+	if (!len || len > KVM_XOM_MAX_PATCH_LEN) {
+		ret = -EINVAL;
 		goto out;
 	}
+
+	patch = kmalloc(sizeof(*patch), GFP_KERNEL);
+	if (!patch) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	patch->gpa = patch_gpa;
+	patch->len = len;
+	memcpy(patch->original, original, len);
+
+	mutex_lock(&kvm->arch.xom.lock);
+
+	entry = xa_load(&kvm->arch.xom.gfns, gfn);
+	if (!entry) {
+		new_entry = kmalloc(sizeof(*new_entry), GFP_KERNEL);
+		if (!new_entry) {
+			ret = -ENOMEM;
+			goto out_unlock;
+		}
+		INIT_LIST_HEAD(&new_entry->patches);
+
+		entry = xa_store(&kvm->arch.xom.gfns, gfn, new_entry, GFP_KERNEL);
+		if (xa_is_err(entry)) {
+			ret = xa_err(entry);
+			goto out_unlock;
+		}
+		entry = new_entry;
+		new_entry = NULL;
+	}
+
+	list_for_each_entry(tmp, &entry->patches, node) {
+		if (tmp->gpa == patch_gpa)
+			goto out_unlock;
+	}
+
+	list_add_tail(&patch->node, &entry->patches);
+	patch = NULL;
+
+out_unlock:
+	mutex_unlock(&kvm->arch.xom.lock);
+	kfree(new_entry);
+	kfree(patch);
+
+	if (ret)
+		goto out;
 
 	kvm_zap_gfn_range(kvm, gfn, gfn + 1);
 
@@ -8190,6 +8271,36 @@ out:
 	return ret;
 }
 EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_mark_gfn_xom);
+
+int kvm_unmark_gfn_xom(struct kvm *kvm, gfn_t gfn)
+{
+	struct kvm_xom_entry *entry;
+	struct kvm_xom_patch *patch, *tmp;
+	int ret = 0;
+
+	mutex_lock(&kvm->arch.xom.lock);
+	entry = xa_erase(&kvm->arch.xom.gfns, gfn);
+	mutex_unlock(&kvm->arch.xom.lock);
+
+	if (!entry)
+		return 0;
+
+	list_for_each_entry_safe(patch, tmp, &entry->patches, node) {
+		int r;
+
+		r = kvm_write_guest(kvm, patch->gpa, patch->original, patch->len);
+		if (r && !ret)
+			ret = r;
+
+		list_del(&patch->node);
+		kfree(patch);
+	}
+	kfree(entry);
+
+	kvm_zap_gfn_range(kvm, gfn, gfn + 1);
+	return ret;
+}
+EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_unmark_gfn_xom);
 
 bool kvm_is_gfn_xom(struct kvm *kvm, gfn_t gfn)
 {
