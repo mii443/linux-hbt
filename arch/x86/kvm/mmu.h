@@ -90,6 +90,8 @@ int kvm_mark_gfn_xom(struct kvm *kvm, gfn_t gfn, gpa_t patch_gpa,
 int kvm_unmark_gfn_xom(struct kvm *kvm, gfn_t gfn);
 bool kvm_is_gfn_xom(struct kvm *kvm, gfn_t gfn);
 unsigned int kvm_mmu_maybe_xom_access(struct kvm *kvm, gfn_t gfn, unsigned int access);
+int kvm_vcpu_read_xom_guest(struct kvm_vcpu *vcpu, gpa_t gpa,
+			    void *data, unsigned int len);
 
 void kvm_init_mmu(struct kvm_vcpu *vcpu);
 void kvm_init_shadow_npt_mmu(struct kvm_vcpu *vcpu, unsigned long cr0,

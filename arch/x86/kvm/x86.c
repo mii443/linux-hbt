@@ -8132,7 +8132,7 @@ struct read_write_emulator_ops {
 static int emulator_read_guest(struct kvm_vcpu *vcpu, gpa_t gpa,
 			       void *val, int bytes)
 {
-	return !kvm_vcpu_read_guest(vcpu, gpa, val, bytes);
+	return !kvm_vcpu_read_xom_guest(vcpu, gpa, val, bytes);
 }
 
 static int emulator_write_guest(struct kvm_vcpu *vcpu, gpa_t gpa,

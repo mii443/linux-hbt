@@ -8308,6 +8308,63 @@ bool kvm_is_gfn_xom(struct kvm *kvm, gfn_t gfn)
 }
 EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_is_gfn_xom);
 
+static void kvm_xom_copy_patch_original(struct kvm_xom_patch *patch,
+					gpa_t gpa, void *data,
+					unsigned int len)
+{
+	gpa_t start = max(gpa, patch->gpa);
+	gpa_t end = min(gpa + len, patch->gpa + patch->len);
+	u8 *buf = data;
+
+	if (start >= end)
+		return;
+
+	memcpy(buf + (start - gpa), patch->original + (start - patch->gpa),
+	       end - start);
+}
+
+int kvm_vcpu_read_xom_guest(struct kvm_vcpu *vcpu, gpa_t gpa, void *data,
+			    unsigned int len)
+{
+	struct kvm *kvm = vcpu->kvm;
+	unsigned int remaining = len;
+	gpa_t cur_gpa = gpa;
+	u8 *buf = data;
+	int ret;
+
+	ret = kvm_vcpu_read_guest(vcpu, gpa, data, len);
+	if (ret)
+		return ret;
+
+	while (remaining) {
+		gfn_t gfn = gpa_to_gfn(cur_gpa) & ~kvm_gfn_direct_bits(kvm);
+		unsigned int offset = offset_in_page(cur_gpa);
+		unsigned int bytes = min(remaining,
+					 (unsigned int)PAGE_SIZE - offset);
+		struct kvm_xom_entry *entry;
+		struct kvm_xom_patch *patch;
+
+		if (!kvm_is_gfn_xom(kvm, gfn))
+			goto next;
+
+		mutex_lock(&kvm->arch.xom.lock);
+		entry = xa_load(&kvm->arch.xom.gfns, gfn);
+		if (entry) {
+			list_for_each_entry(patch, &entry->patches, node)
+				kvm_xom_copy_patch_original(patch, cur_gpa,
+							    buf, bytes);
+		}
+		mutex_unlock(&kvm->arch.xom.lock);
+
+next:
+		cur_gpa += bytes;
+		buf += bytes;
+		remaining -= bytes;
+	}
+
+	return 0;
+}
+
 unsigned int kvm_mmu_maybe_xom_access(struct kvm *kvm, gfn_t gfn, unsigned int access)
 {
 	if (kvm_is_gfn_xom(kvm, gfn) && (access & ACC_EXEC_MASK))
