@@ -6715,12 +6715,12 @@ static int __vmx_handle_exit(struct kvm_vcpu *vcpu, fastpath_t exit_fastpath)
 
 				ret = kvm_mark_gfn_xom(vcpu->kvm, gfn, gpa,
 						       buf, sizeof(skip_patch));
-				if (ret)
+				if (unlikely(ret))
 					return ret;
 				ret = kvm_vcpu_write_guest(vcpu, gpa,
 							   skip_patch,
 							   sizeof(skip_patch));
-				if (ret) {
+				if (unlikely(ret)) {
 					kvm_unmark_gfn_xom(vcpu->kvm, gfn);
 					return ret;
 				}
