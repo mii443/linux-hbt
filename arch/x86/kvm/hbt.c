@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-/* Observation-only #UD analysis. No decoder or patch installation lives here. */
+/* #UD analysis and explicit single-vCPU retry. No decoder or patch installer. */
 #include <linux/kvm_host.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
@@ -11,6 +11,7 @@ struct kvm_hbt_state {
 	struct kvm_hbt_snapshot snapshot;
 	u64 cr0, cr4, efer;
 	bool acknowledged;
+	bool retry;
 };
 
 static unsigned int kvm_hbt_mode(struct kvm_vcpu *vcpu)
@@ -26,16 +27,12 @@ static unsigned int kvm_hbt_mode(struct kvm_vcpu *vcpu)
 	return 0;
 }
 
-static int kvm_hbt_finish(struct kvm_vcpu *vcpu)
+static bool kvm_hbt_same_context(struct kvm_vcpu *vcpu,
+				 struct kvm_hbt_state *state)
 {
-	struct kvm_hbt_state *state = vcpu->arch.hbt;
-	struct kvm_hbt_snapshot *s;
-	bool same_context;
+	struct kvm_hbt_snapshot *s = &state->snapshot;
 
-	if (!state)
-		return 1;
-	s = &state->snapshot;
-	same_context = kvm_rip_read(vcpu) == s->rip &&
+	return kvm_rip_read(vcpu) == s->rip &&
 		kvm_get_linear_rip(vcpu) == s->linear_rip &&
 		kvm_read_cr3(vcpu) == s->cr3 &&
 		kvm_read_cr0(vcpu) == state->cr0 &&
@@ -44,6 +41,17 @@ static int kvm_hbt_finish(struct kvm_vcpu *vcpu)
 		kvm_hbt_mode(vcpu) == s->mode &&
 		!is_guest_mode(vcpu) && !vcpu->arch.guest_state_protected &&
 		!vcpu->arch.exception.pending && !vcpu->arch.exception.injected;
+}
+
+static int kvm_hbt_finish(struct kvm_vcpu *vcpu)
+{
+	struct kvm_hbt_state *state = vcpu->arch.hbt;
+	bool same_context, retry;
+
+	if (!state)
+		return 1;
+	same_context = kvm_hbt_same_context(vcpu, state);
+	retry = state->acknowledged && state->retry;
 	vcpu->arch.hbt = NULL;
 	kfree(state);
 
@@ -52,7 +60,7 @@ static int kvm_hbt_finish(struct kvm_vcpu *vcpu)
 	 * directly, so the same fault is not submitted to userspace again.
 	 * Userspace may have replaced the vCPU context while it was stopped.
 	 */
-	return same_context ? handle_ud(vcpu) : 1;
+	return same_context && !retry ? handle_ud(vcpu) : 1;
 }
 
 void kvm_hbt_reset(struct kvm_vcpu *vcpu)
@@ -146,12 +154,19 @@ long kvm_hbt_ioctl(struct kvm_vcpu *vcpu, unsigned int cmd, void __user *argp)
 		if (copy_from_user(&reply, argp, sizeof(reply)))
 			return -EFAULT;
 		if (reply.version != KVM_HBT_ABI_VERSION || reply.reserved ||
-		    reply.action != KVM_HBT_COMPLETE_FALLBACK)
+		    reply.action > KVM_HBT_COMPLETE_RETRY)
 			return -EINVAL;
 		if (reply.request_id != state->snapshot.request_id)
 			return -ESTALE;
 		if (state->acknowledged)
 			return -EALREADY;
+		if (reply.action == KVM_HBT_COMPLETE_RETRY) {
+			if (!vcpu->kvm->arch.hbt_retry_enabled)
+				return -EOPNOTSUPP;
+			if (!kvm_hbt_same_context(vcpu, state))
+				return -ESTALE;
+			state->retry = true;
+		}
 		state->acknowledged = true;
 		return 0;
 	}

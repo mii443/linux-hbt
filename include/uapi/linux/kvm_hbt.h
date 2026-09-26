@@ -7,6 +7,7 @@
 
 /* Private linux-hbt ABI, not an upstream KVM capability or exit number. */
 #define KVM_CAP_HBT_X86_UD	0x48425401
+#define KVM_CAP_HBT_X86_RETRY	0x48425402
 #define KVM_EXIT_HBT_X86_UD	0x48425401
 #define KVM_HBT_ABI_VERSION	1
 #define KVM_HBT_MAX_BYTES	4096
@@ -41,6 +42,7 @@ struct kvm_hbt_snapshot_request {
 };
 
 #define KVM_HBT_COMPLETE_FALLBACK	0
+#define KVM_HBT_COMPLETE_RETRY	1
 struct kvm_hbt_completion {
 	__u32 version;
 	__u32 action;

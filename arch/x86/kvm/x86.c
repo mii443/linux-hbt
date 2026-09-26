@@ -4877,6 +4877,7 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
 		r = tdp_enabled;
 		break;
 	case KVM_CAP_HBT_X86_UD:
+	case KVM_CAP_HBT_X86_RETRY:
 		if (kvm_caps.has_hbt_ud &&
 		    (!kvm || kvm->arch.vm_type == KVM_X86_DEFAULT_VM))
 			r = KVM_HBT_ABI_VERSION;
@@ -6913,6 +6914,23 @@ disable_exits_unlock:
 			break;
 		kvm->arch.exit_on_emulation_error = cap->args[0];
 		r = 0;
+		break;
+	case KVM_CAP_HBT_X86_RETRY:
+		r = -EINVAL;
+		if (!kvm_caps.has_hbt_ud || !kvm->arch.hbt_ud_enabled ||
+		    kvm->arch.vm_type != KVM_X86_DEFAULT_VM ||
+		    cap->args[0] != KVM_HBT_ABI_VERSION ||
+		    cap->args[1] || cap->args[2] || cap->args[3])
+			break;
+		mutex_lock(&kvm->lock);
+		r = -EBUSY;
+		if (!kvm->created_vcpus) {
+			kvm->arch.hbt_retry_enabled = true;
+			/* Keep the experimental patch/retry path single-vCPU. */
+			kvm->max_vcpus = 1;
+			r = 0;
+		}
+		mutex_unlock(&kvm->lock);
 		break;
 	case KVM_CAP_HBT_X86_UD:
 		r = -EINVAL;

@@ -1549,6 +1549,7 @@ struct kvm_arch {
 	 */
 	bool exit_on_emulation_error;
 	bool hbt_ud_enabled;
+	bool hbt_retry_enabled;
 
 	/* Deflect RDMSR and WRMSR to user space when they trigger a #GP */
 	u32 user_space_msr_mask;
