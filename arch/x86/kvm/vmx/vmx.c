@@ -71,6 +71,8 @@
 #include "vmx.h"
 #include "x86.h"
 #include "x86_ops.h"
+#include "xom.h"
+#include "hbt.h"
 #include "smm.h"
 #include "vmx_onhyperv.h"
 #include "posted_intr.h"
@@ -100,6 +102,11 @@ module_param_named(flexpriority, flexpriority_enabled, bool, 0444);
 
 bool __read_mostly enable_ept = 1;
 module_param_named(ept, enable_ept, bool, 0444);
+
+static bool __read_mostly xom_skip_experiment;
+module_param(xom_skip_experiment, bool, 0444);
+MODULE_PARM_DESC(xom_skip_experiment,
+		"Enable the legacy EVEX skip experiment (changes guest semantics)");
 
 bool __read_mostly enable_unrestricted_guest = 1;
 module_param_named(unrestricted_guest,
@@ -5367,6 +5374,8 @@ handle_pf:
 	return kvm_handle_page_fault(vcpu, error_code, cr2, NULL, 0);
 }
 
+static int vmx_handle_xom_ud(struct kvm_vcpu *vcpu);
+
 static int handle_exception_nmi(struct kvm_vcpu *vcpu)
 {
 	struct vcpu_vmx *vmx = to_vmx(vcpu);
@@ -5398,8 +5407,21 @@ static int handle_exception_nmi(struct kvm_vcpu *vcpu)
 		return 1;
 	}
 
-	if (is_invalid_opcode(intr_info))
-		return handle_ud(vcpu);
+	if (is_invalid_opcode(intr_info)) {
+		int ret;
+
+		if (vcpu->kvm->arch.hbt_ud_enabled) {
+			if (!(vect_info & VECTORING_INFO_VALID_MASK) &&
+			    kvm_hbt_prepare_ud(vcpu))
+				return 0;
+			return handle_ud(vcpu);
+		}
+		if (!xom_skip_experiment)
+			return handle_ud(vcpu);
+		ret = vmx_handle_xom_ud(vcpu);
+
+		return ret ? ret : handle_ud(vcpu);
+	}
 
 	if (WARN_ON_ONCE(is_ve_fault(intr_info))) {
 		struct vmx_ve_information *ve_info = vmx->ve_info;
@@ -6667,17 +6689,115 @@ void dump_vmcs(struct kvm_vcpu *vcpu)
 	}
 }
 
+/* Return zero to leave unsupported instructions/fetch failures to handle_ud(). */
+static int vmx_handle_xom_ud(struct kvm_vcpu *vcpu)
+{
+	u8 buf[16] = {}, patch[MAX_INSN_SIZE];
+	u8 check[KVM_XOM_CODE_CAVE_MIN_LEN + MAX_INSN_SIZE];
+	struct x86_exception e = {};
+	struct insn insn;
+	enum insn_mode mode;
+	unsigned long rip, cave_gva = 0;
+	gpa_t gpa, page_gpa, cave_gpa = INVALID_GPA;
+	unsigned int pos, cave_offset, cave_len = 0;
+	int cs_db, cs_l, cave_ret, ret = 0;
+	u64 start_tsc;
+	gfn_t gfn;
+	u8 *page;
+
+	if (!enable_ept || !cpu_has_vmx_ept_execute_only() ||
+	    is_guest_mode(vcpu) || vcpu->arch.guest_state_protected ||
+	    (to_vmx(vcpu)->idt_vectoring_info & VECTORING_INFO_VALID_MASK))
+		return 0;
+
+	kvm_x86_call(get_cs_db_l_bits)(vcpu, &cs_db, &cs_l);
+	if (is_long_mode(vcpu) && cs_l)
+		mode = INSN_MODE_64;
+	else if (is_protmode(vcpu) && cs_db &&
+		 !(kvm_get_rflags(vcpu) & X86_EFLAGS_VM))
+		mode = INSN_MODE_32;
+	else
+		return 0;
+
+	start_tsc = rdtsc();
+	rip = kvm_get_linear_rip(vcpu);
+	pos = offset_in_page(rip);
+	gpa = kvm_mmu_gva_to_gpa_fetch(vcpu, rip, &e);
+	if (gpa == INVALID_GPA)
+		return 0;
+	page_gpa = gpa & ~(gpa_t)(PAGE_SIZE - 1);
+
+	page = kmalloc(PAGE_SIZE, GFP_KERNEL);
+	if (!page)
+		return 0;
+
+	/* Read the exact GPA whose execute permission was checked above. */
+	if (kvm_vcpu_read_guest(vcpu, page_gpa, page, PAGE_SIZE))
+		goto out;
+
+	/* A cross-page instruction cannot be patched with one XOM entry. */
+	if (insn_decode(&insn, page + pos, PAGE_SIZE - pos, mode) ||
+	    insn.vex_prefix.nbytes != 4 || insn.length < 2 ||
+	    insn.length > sizeof(patch))
+		goto out;
+
+	memcpy(buf, page + pos, insn.length);
+	memset(patch, 0x90, insn.length);
+	patch[0] = 0xeb;
+	patch[1] = insn.length - 2;
+
+	/* Only the decoded instruction end is a known boundary for this scan. */
+	cave_ret = vmx_xom_find_nop_run(page, PAGE_SIZE, pos + insn.length,
+				       mode, KVM_XOM_CODE_CAVE_MIN_LEN,
+				       &cave_offset, &cave_len);
+	if (!cave_ret) {
+		cave_gva = (rip & PAGE_MASK) + cave_offset;
+		cave_gpa = page_gpa + cave_offset;
+
+		/* Candidates are observations, not reservations for later writes. */
+		if (kvm_vcpu_read_guest(vcpu, cave_gpa, check, cave_len))
+			cave_ret = -EFAULT;
+		else if (memcmp(check, page + cave_offset, cave_len))
+			cave_ret = -EAGAIN;
+	}
+	if (cave_ret) {
+		cave_gva = 0;
+		cave_gpa = INVALID_GPA;
+		cave_len = 0;
+	}
+
+	/* Detect a changed mapping or instruction before applying the patch. */
+	if (kvm_mmu_gva_to_gpa_fetch(vcpu, rip, &e) != gpa ||
+	    kvm_vcpu_read_guest(vcpu, gpa, check, insn.length) ||
+	    memcmp(check, buf, insn.length))
+		goto out;
+
+	gfn = gpa_to_gfn(gpa) & ~kvm_gfn_direct_bits(vcpu->kvm);
+	ret = kvm_mark_gfn_xom(vcpu->kvm, gfn, gpa, buf, insn.length);
+	if (ret)
+		goto out;
+	ret = kvm_vcpu_write_guest(vcpu, gpa, patch, insn.length);
+	if (ret) {
+		kvm_unmark_gfn_xom(vcpu->kvm, gfn);
+		goto out;
+	}
+
+	trace_kvm_ud_exit(vcpu, kvm_rip_read(vcpu), buf, insn.length,
+			  rdtsc() - start_tsc, cave_ret, cave_gva, cave_gpa,
+			  cave_len);
+	ret = 1;
+
+out:
+	kfree(page);
+	return ret;
+}
+
 /*
  * The guest has exited.  See if we can fix it or if we need userspace
  * assistance.
  */
 static int __vmx_handle_exit(struct kvm_vcpu *vcpu, fastpath_t exit_fastpath)
 {
-	unsigned long long rdtsc_ret, rdtsc_ret2;
-	unsigned eax, edx;
-	__asm__ volatile("rdtsc" : "=a" (eax), "=d" (edx));
-	rdtsc_ret = ((unsigned long long)eax) | (((unsigned long long)edx) << 32);
-
 	struct vcpu_vmx *vmx = to_vmx(vcpu);
 	union vmx_exit_reason exit_reason = vmx_get_exit_reason(vcpu);
 	u32 vectoring_info = vmx->idt_vectoring_info;
@@ -6686,53 +6806,8 @@ static int __vmx_handle_exit(struct kvm_vcpu *vcpu, fastpath_t exit_fastpath)
 
 	if (exit_reason.basic == EXIT_REASON_EXCEPTION_NMI) {
 		u32 intr_info = vmx_get_intr_info(vcpu);
+
 		vector = intr_info & INTR_INFO_VECTOR_MASK;
-
-		if (vector == UD_VECTOR) {
-			u8 buf[16];
-			int ret;
-			struct x86_exception e;
-
-			unsigned long rip = vmcs_readl(GUEST_RIP);
-			ret = kvm_read_guest_virt(vcpu, rip, buf, sizeof(buf), &e);
-
-			if (unlikely(ret != X86EMUL_CONTINUE)) {
-				return 0;
-			}
-
-			if (likely(buf[0] == 0x62)) {
-				static const u8 skip_patch[6] = {
-					0xeb, 0x04, 0x90, 0x90, 0x90, 0x90
-				};
-				gpa_t gpa = kvm_mmu_gva_to_gpa_read(vcpu, rip, &e);
-				gfn_t gfn;
-
-				if (unlikely(gpa == INVALID_GPA))
-					return 0;
-
-				gfn = gpa_to_gfn(gpa) &
-				      ~kvm_gfn_direct_bits(vcpu->kvm);
-
-				ret = kvm_mark_gfn_xom(vcpu->kvm, gfn, gpa,
-						       buf, sizeof(skip_patch));
-				if (unlikely(ret))
-					return ret;
-				ret = kvm_vcpu_write_guest(vcpu, gpa,
-							   skip_patch,
-							   sizeof(skip_patch));
-				if (unlikely(ret)) {
-					kvm_unmark_gfn_xom(vcpu->kvm, gfn);
-					return ret;
-				}
-
-				__asm__ volatile("rdtsc" : "=a" (eax), "=d" (edx));
-				rdtsc_ret2 = ((unsigned long long)eax) | (((unsigned long long)edx) << 32);
-				unsigned long long delta_vmexit = rdtsc_ret2 - rdtsc_ret;
-
-				trace_kvm_ud_exit(vcpu, rip, buf, delta_vmexit);
-				return 1;
-			}
-		}
 	}
 
 	trace_kvm_vmx_handle_exit(vcpu, exit_reason.full, exit_fastpath, vector);
@@ -8740,6 +8815,7 @@ __init int vmx_hardware_setup(void)
 	kvm_caps.tsc_scaling_ratio_frac_bits = 48;
 	kvm_caps.has_bus_lock_exit = cpu_has_vmx_bus_lock_detection();
 	kvm_caps.has_notify_vmexit = cpu_has_notify_vmexit();
+	kvm_caps.has_hbt_ud = true;
 
 	set_bit(0, vmx_vpid_bitmap); /* 0 is reserved for host */
 

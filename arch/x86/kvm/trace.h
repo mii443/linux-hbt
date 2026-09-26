@@ -476,13 +476,21 @@ TRACE_EVENT(kvm_vmx_handle_exit,
  * Tracepoint for kvm #UD exit
  */
 TRACE_EVENT(kvm_ud_exit,
-	TP_PROTO(struct kvm_vcpu *vcpu, unsigned long guest_rip, u8 *guest_inst, unsigned long long vmexit_tsc),
-	TP_ARGS(vcpu, guest_rip, guest_inst, vmexit_tsc),
+	TP_PROTO(struct kvm_vcpu *vcpu, unsigned long guest_rip, u8 *guest_inst,
+		 u8 guest_inst_len, unsigned long long vmexit_tsc, int cave_ret,
+		 unsigned long cave_gva, gpa_t cave_gpa, unsigned int cave_len),
+	TP_ARGS(vcpu, guest_rip, guest_inst, guest_inst_len, vmexit_tsc,
+		cave_ret, cave_gva, cave_gpa, cave_len),
 
 	TP_STRUCT__entry(
 		__field(	unsigned int,	vcpu_id		)
 		__field(	unsigned long,	guest_rip	)
 		__field(	unsigned long long, vmexit_tsc	)
+		__field(	u8,		guest_inst_len	)
+		__field(	int,		cave_ret	)
+		__field(	unsigned long,	cave_gva	)
+		__field(	gpa_t,		cave_gpa	)
+		__field(	unsigned int,	cave_len	)
 		__array(	u8,		guest_inst, 16	)
 	),
 
@@ -490,14 +498,24 @@ TRACE_EVENT(kvm_ud_exit,
 		__entry->vcpu_id        = vcpu->vcpu_id;
 		__entry->guest_rip      = guest_rip;
 		__entry->vmexit_tsc = vmexit_tsc;
+		__entry->guest_inst_len = guest_inst_len;
+		__entry->cave_ret = cave_ret;
+		__entry->cave_gva = cave_gva;
+		__entry->cave_gpa = cave_gpa;
+		__entry->cave_len = cave_len;
 		memcpy(__entry->guest_inst, guest_inst, sizeof(__entry->guest_inst));
 	),
 
-	TP_printk("vcpu %u rip 0x%lx inst %s vmexit_tsc %llu",
+	TP_printk("vcpu %u rip 0x%lx inst %s len %u vmexit_tsc %llu cave_ret %d cave_gva 0x%lx cave_gpa 0x%llx cave_len %u",
 		  __entry->vcpu_id,
 		  __entry->guest_rip,
 		  __print_hex(__entry->guest_inst, sizeof(__entry->guest_inst)),
-		  __entry->vmexit_tsc)
+		  __entry->guest_inst_len,
+		  __entry->vmexit_tsc,
+		  __entry->cave_ret,
+		  __entry->cave_gva,
+		  (unsigned long long)__entry->cave_gpa,
+		  __entry->cave_len)
 );
 
 /*

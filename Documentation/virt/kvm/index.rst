@@ -8,6 +8,7 @@ KVM
    :maxdepth: 2
 
    api
+   hbt
    devices/index
 
    arm/index

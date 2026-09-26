@@ -13,6 +13,7 @@
 #include <linux/compiler.h>
 #include <linux/stddef.h>
 #include <linux/ioctl.h>
+#include <linux/kvm_hbt.h>
 #include <asm/kvm.h>
 
 #ifdef __KERNEL__
@@ -243,6 +244,8 @@ struct kvm_run {
 	__u64 psw_addr; /* psw lower half */
 #endif
 	union {
+		/* KVM_EXIT_HBT_X86_UD (private linux-hbt ABI) */
+		struct kvm_hbt_exit hbt;
 		/* KVM_EXIT_UNKNOWN */
 		struct {
 			__u64 hardware_exit_reason;

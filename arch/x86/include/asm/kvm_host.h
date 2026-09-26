@@ -946,6 +946,8 @@ struct kvm_vcpu_arch {
 	int (*complete_userspace_io)(struct kvm_vcpu *vcpu);
 	unsigned long cui_linear_rip;
 	int cui_rdmsr_imm_reg;
+	struct kvm_hbt_state *hbt;
+	u64 hbt_request_id;
 
 	gpa_t time;
 	s8  pvclock_tsc_shift;
@@ -1546,6 +1548,7 @@ struct kvm_arch {
 	 * the opportunity to look at it.
 	 */
 	bool exit_on_emulation_error;
+	bool hbt_ud_enabled;
 
 	/* Deflect RDMSR and WRMSR to user space when they trigger a #GP */
 	u32 user_space_msr_mask;
@@ -2325,6 +2328,8 @@ void kvm_mmu_free_roots(struct kvm *kvm, struct kvm_mmu *mmu,
 void kvm_mmu_free_guest_mode_roots(struct kvm *kvm, struct kvm_mmu *mmu);
 gpa_t kvm_mmu_gva_to_gpa_read(struct kvm_vcpu *vcpu, gva_t gva,
 			      struct x86_exception *exception);
+gpa_t kvm_mmu_gva_to_gpa_fetch(struct kvm_vcpu *vcpu, gva_t gva,
+			       struct x86_exception *exception);
 gpa_t kvm_mmu_gva_to_gpa_write(struct kvm_vcpu *vcpu, gva_t gva,
 			       struct x86_exception *exception);
 gpa_t kvm_mmu_gva_to_gpa_system(struct kvm_vcpu *vcpu, gva_t gva,

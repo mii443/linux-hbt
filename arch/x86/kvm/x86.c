@@ -27,6 +27,7 @@
 #include "kvm_emulate.h"
 #include "mmu/page_track.h"
 #include "x86.h"
+#include "hbt.h"
 #include "cpuid.h"
 #include "pmu.h"
 #include "hyperv.h"
@@ -4875,6 +4876,11 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
 	case KVM_CAP_PRE_FAULT_MEMORY:
 		r = tdp_enabled;
 		break;
+	case KVM_CAP_HBT_X86_UD:
+		if (kvm_caps.has_hbt_ud &&
+		    (!kvm || kvm->arch.vm_type == KVM_X86_DEFAULT_VM))
+			r = KVM_HBT_ABI_VERSION;
+		break;
 	case KVM_CAP_X86_APIC_BUS_CYCLES_NS:
 		r = APIC_BUS_CYCLE_NS_DEFAULT;
 		break;
@@ -6222,6 +6228,10 @@ long kvm_arch_vcpu_ioctl(struct file *filp,
 
 	u.buffer = NULL;
 	switch (ioctl) {
+	case KVM_HBT_GET_SNAPSHOT:
+	case KVM_HBT_COMPLETE:
+		r = kvm_hbt_ioctl(vcpu, ioctl, argp);
+		break;
 	case KVM_GET_LAPIC: {
 		r = -EINVAL;
 		if (!lapic_in_kernel(vcpu))
@@ -6903,6 +6913,21 @@ disable_exits_unlock:
 			break;
 		kvm->arch.exit_on_emulation_error = cap->args[0];
 		r = 0;
+		break;
+	case KVM_CAP_HBT_X86_UD:
+		r = -EINVAL;
+		if (!kvm_caps.has_hbt_ud ||
+		    kvm->arch.vm_type != KVM_X86_DEFAULT_VM ||
+		    cap->args[0] != KVM_HBT_ABI_VERSION ||
+		    cap->args[1] || cap->args[2] || cap->args[3])
+			break;
+		mutex_lock(&kvm->lock);
+		r = -EBUSY;
+		if (!kvm->created_vcpus) {
+			kvm->arch.hbt_ud_enabled = true;
+			r = 0;
+		}
+		mutex_unlock(&kvm->lock);
 		break;
 	case KVM_CAP_PMU_CAPABILITY:
 		r = -EINVAL;
@@ -7871,6 +7896,17 @@ gpa_t kvm_mmu_gva_to_gpa_read(struct kvm_vcpu *vcpu, gva_t gva,
 	return mmu->gva_to_gpa(vcpu, mmu, gva, access, exception);
 }
 EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_mmu_gva_to_gpa_read);
+
+gpa_t kvm_mmu_gva_to_gpa_fetch(struct kvm_vcpu *vcpu, gva_t gva,
+			       struct x86_exception *exception)
+{
+	struct kvm_mmu *mmu = vcpu->arch.walk_mmu;
+
+	u64 access = (kvm_x86_call(get_cpl)(vcpu) == 3) ? PFERR_USER_MASK : 0;
+	access |= PFERR_FETCH_MASK;
+	return mmu->gva_to_gpa(vcpu, mmu, gva, access, exception);
+}
+EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_mmu_gva_to_gpa_fetch);
 
 gpa_t kvm_mmu_gva_to_gpa_write(struct kvm_vcpu *vcpu, gva_t gva,
 			       struct x86_exception *exception)
@@ -12946,6 +12982,7 @@ void kvm_arch_vcpu_destroy(struct kvm_vcpu *vcpu)
 {
 	int idx, cpu;
 
+	kvm_hbt_reset(vcpu);
 	kvm_clear_async_pf_completion_queue(vcpu);
 	kvm_mmu_unload(vcpu);
 
@@ -13025,6 +13062,8 @@ void kvm_vcpu_reset(struct kvm_vcpu *vcpu, bool init_event)
 	struct kvm_cpuid_entry2 *cpuid_0x1;
 	unsigned long old_cr0 = kvm_read_cr0(vcpu);
 	unsigned long new_cr0;
+
+	kvm_hbt_reset(vcpu);
 
 	/*
 	 * Several of the "set" flows, e.g. ->set_cr0(), read other registers
