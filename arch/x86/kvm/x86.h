@@ -28,6 +28,7 @@ struct kvm_caps {
 	/* notify VM exit supported? */
 	bool has_notify_vmexit;
 	bool has_hbt_ud;
+	bool has_hbt_xom;
 	/* bit mask of VM types */
 	u32 supported_vm_types;
 

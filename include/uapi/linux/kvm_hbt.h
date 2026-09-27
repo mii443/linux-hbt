@@ -8,6 +8,7 @@
 /* Private linux-hbt ABI, not an upstream KVM capability or exit number. */
 #define KVM_CAP_HBT_X86_UD	0x48425401
 #define KVM_CAP_HBT_X86_RETRY	0x48425402
+#define KVM_CAP_HBT_X86_XOM	0x48425403
 #define KVM_EXIT_HBT_X86_UD	0x48425401
 #define KVM_HBT_ABI_VERSION	1
 #define KVM_HBT_MAX_BYTES	4096
@@ -50,10 +51,26 @@ struct kvm_hbt_completion {
 	__u64 reserved;
 };
 
+/*
+ * Install one aligned 4 KiB page and acknowledge RETRY in one operation.
+ * Both user pointers address KVM_HBT_MAX_BYTES bytes. No guest writes may
+ * precede this ioctl. On error, guest bytes and pending completion are intact.
+ */
+struct kvm_hbt_xom_install {
+	__u32 version;
+	__u32 reserved;
+	__u64 request_id;
+	__u64 gpa;
+	__u64 original_addr;
+	__u64 replacement_addr;
+};
+
 /* Private vCPU ioctls. KVMIO is 0xae; keep this header self-contained. */
 #define KVM_HBT_GET_SNAPSHOT \
 	_IOW(0xae, 0xe8, struct kvm_hbt_snapshot_request)
 #define KVM_HBT_COMPLETE \
 	_IOW(0xae, 0xe9, struct kvm_hbt_completion)
+#define KVM_HBT_INSTALL_XOM \
+	_IOW(0xae, 0xea, struct kvm_hbt_xom_install)
 
 #endif /* _UAPI_LINUX_KVM_HBT_H */

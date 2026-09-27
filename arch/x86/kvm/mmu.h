@@ -85,6 +85,8 @@ void kvm_mmu_set_ept_masks(bool has_ad_bits, bool has_exec_only);
 
 void kvm_xom_init(struct kvm *kvm);
 void kvm_xom_destroy(struct kvm *kvm);
+int kvm_install_xom_page(struct kvm_vcpu *vcpu, gpa_t gpa,
+			 const u8 *original, const u8 *replacement);
 int kvm_mark_gfn_xom(struct kvm *kvm, gfn_t gfn, gpa_t patch_gpa,
 		     const u8 *original, u8 len);
 int kvm_unmark_gfn_xom(struct kvm *kvm, gfn_t gfn);

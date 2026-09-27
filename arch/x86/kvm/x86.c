@@ -4882,6 +4882,11 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
 		    (!kvm || kvm->arch.vm_type == KVM_X86_DEFAULT_VM))
 			r = KVM_HBT_ABI_VERSION;
 		break;
+	case KVM_CAP_HBT_X86_XOM:
+		if (kvm_caps.has_hbt_xom &&
+		    (!kvm || kvm->arch.vm_type == KVM_X86_DEFAULT_VM))
+			r = KVM_HBT_ABI_VERSION;
+		break;
 	case KVM_CAP_X86_APIC_BUS_CYCLES_NS:
 		r = APIC_BUS_CYCLE_NS_DEFAULT;
 		break;
@@ -6233,6 +6238,11 @@ long kvm_arch_vcpu_ioctl(struct file *filp,
 	case KVM_HBT_COMPLETE:
 		r = kvm_hbt_ioctl(vcpu, ioctl, argp);
 		break;
+	case KVM_HBT_INSTALL_XOM:
+		kvm_vcpu_srcu_read_lock(vcpu);
+		r = kvm_hbt_ioctl(vcpu, ioctl, argp);
+		kvm_vcpu_srcu_read_unlock(vcpu);
+		break;
 	case KVM_GET_LAPIC: {
 		r = -EINVAL;
 		if (!lapic_in_kernel(vcpu))
@@ -6914,6 +6924,20 @@ disable_exits_unlock:
 			break;
 		kvm->arch.exit_on_emulation_error = cap->args[0];
 		r = 0;
+		break;
+	case KVM_CAP_HBT_X86_XOM:
+		r = -EINVAL;
+		if (!kvm_caps.has_hbt_xom || !kvm->arch.hbt_retry_enabled ||
+		    cap->args[0] != KVM_HBT_ABI_VERSION ||
+		    cap->args[1] || cap->args[2] || cap->args[3])
+			break;
+		mutex_lock(&kvm->lock);
+		r = -EBUSY;
+		if (!kvm->created_vcpus) {
+			kvm->arch.hbt_xom_enabled = true;
+			r = 0;
+		}
+		mutex_unlock(&kvm->lock);
 		break;
 	case KVM_CAP_HBT_X86_RETRY:
 		r = -EINVAL;
@@ -7962,8 +7986,7 @@ static int kvm_read_guest_virt_helper(gva_t addr, void *val, unsigned int bytes,
 
 		if (gpa == INVALID_GPA)
 			return X86EMUL_PROPAGATE_FAULT;
-		ret = kvm_vcpu_read_guest_page(vcpu, gpa >> PAGE_SHIFT, data,
-					       offset, toread);
+		ret = kvm_vcpu_read_xom_guest(vcpu, gpa, data, toread);
 		if (ret < 0) {
 			r = X86EMUL_IO_NEEDED;
 			goto out;
@@ -8054,6 +8077,10 @@ static int kvm_write_guest_virt_helper(gva_t addr, void *val, unsigned int bytes
 
 		if (gpa == INVALID_GPA)
 			return X86EMUL_PROPAGATE_FAULT;
+
+		if (kvm_is_gfn_xom(vcpu->kvm, gpa_to_gfn(gpa)) &&
+		    kvm_unmark_gfn_xom(vcpu->kvm, gpa_to_gfn(gpa)))
+			return X86EMUL_UNHANDLEABLE;
 
 		ret = kvm_vcpu_write_guest(vcpu, gpa, data, towrite);
 		if (ret < 0) {
@@ -8194,6 +8221,11 @@ static int emulator_write_guest(struct kvm_vcpu *vcpu, gpa_t gpa,
 {
 	int ret;
 
+	if (kvm_is_gfn_xom(vcpu->kvm, gpa_to_gfn(gpa))) {
+		ret = kvm_unmark_gfn_xom(vcpu->kvm, gpa_to_gfn(gpa));
+		if (ret)
+			return ret;
+	}
 	ret = kvm_vcpu_write_guest(vcpu, gpa, val, bytes);
 	if (ret < 0)
 		return 0;
@@ -8238,8 +8270,13 @@ static int emulator_read_write_onepage(unsigned long addr, void *val,
 	 * i.e. if accessing host user memory failed, but this has been KVM's
 	 * historical ABI for decades.
 	 */
-	if (!ret && ops->read_write_guest(vcpu, gpa, val, bytes))
-		return X86EMUL_CONTINUE;
+	if (!ret) {
+		ret = ops->read_write_guest(vcpu, gpa, val, bytes);
+		if (ret < 0)
+			return X86EMUL_UNHANDLEABLE;
+		if (ret)
+			return X86EMUL_CONTINUE;
+	}
 
 	/*
 	 * Attempt to handle emulated MMIO within the kernel, e.g. for accesses
@@ -8422,6 +8459,10 @@ static int emulator_cmpxchg_emulated(struct x86_emulate_ctxt *ctxt,
 
 	if (((gpa + bytes - 1) & page_line_mask) != (gpa & page_line_mask))
 		goto emul_write;
+
+	if (kvm_is_gfn_xom(vcpu->kvm, gpa_to_gfn(gpa)) &&
+	    kvm_unmark_gfn_xom(vcpu->kvm, gpa_to_gfn(gpa)))
+		return X86EMUL_UNHANDLEABLE;
 
 	hva = kvm_vcpu_gfn_to_hva(vcpu, gpa_to_gfn(gpa));
 	if (kvm_is_error_hva(hva))

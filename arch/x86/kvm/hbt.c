@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0
-/* #UD analysis and explicit single-vCPU retry. No decoder or patch installer. */
+/* #UD analysis, single-vCPU retry and XOM commit. Decoding stays in userspace. */
 #include <linux/kvm_host.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 
 #include "x86.h"
 #include "hbt.h"
+#include "mmu.h"
 
 struct kvm_hbt_state {
 	struct kvm_hbt_snapshot snapshot;
@@ -123,6 +124,51 @@ bool kvm_hbt_prepare_ud(struct kvm_vcpu *vcpu)
 }
 EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_hbt_prepare_ud);
 
+static int kvm_hbt_install_xom(struct kvm_vcpu *vcpu,
+			       struct kvm_hbt_state *state, void __user *argp)
+{
+	struct kvm_hbt_xom_install req;
+	struct x86_exception exception = {};
+	struct kvm_hbt_snapshot *s = &state->snapshot;
+	u8 *images;
+	int ret;
+
+	if (!vcpu->kvm->arch.hbt_xom_enabled)
+		return -EOPNOTSUPP;
+	if (copy_from_user(&req, argp, sizeof(req)))
+		return -EFAULT;
+	if (req.version != KVM_HBT_ABI_VERSION || req.reserved ||
+	    offset_in_page(req.gpa) || req.gpa != (s->gpa & PAGE_MASK))
+		return -EINVAL;
+	if (req.request_id != s->request_id)
+		return -ESTALE;
+	if (state->acknowledged)
+		return -EALREADY;
+	if (!kvm_hbt_same_context(vcpu, state) ||
+	    kvm_mmu_gva_to_gpa_fetch(vcpu, s->linear_rip, &exception) != s->gpa)
+		return -ESTALE;
+
+	images = kmalloc(2 * PAGE_SIZE, GFP_KERNEL_ACCOUNT);
+	if (!images)
+		return -ENOMEM;
+	ret = -EFAULT;
+	if (copy_from_user(images, u64_to_user_ptr(req.original_addr), PAGE_SIZE) ||
+	    copy_from_user(images + PAGE_SIZE,
+			   u64_to_user_ptr(req.replacement_addr), PAGE_SIZE))
+		goto out;
+	ret = -ESTALE;
+	if (memcmp(images + offset_in_page(s->gpa), s->data, s->data_len))
+		goto out;
+	ret = kvm_install_xom_page(vcpu, req.gpa, images, images + PAGE_SIZE);
+	if (!ret) {
+		state->retry = true;
+		state->acknowledged = true;
+	}
+out:
+	kfree(images);
+	return ret;
+}
+
 long kvm_hbt_ioctl(struct kvm_vcpu *vcpu, unsigned int cmd, void __user *argp)
 {
 	struct kvm_hbt_state *state = vcpu->arch.hbt;
@@ -133,6 +179,8 @@ long kvm_hbt_ioctl(struct kvm_vcpu *vcpu, unsigned int cmd, void __user *argp)
 		return -ENOENT;
 
 	switch (cmd) {
+	case KVM_HBT_INSTALL_XOM:
+		return kvm_hbt_install_xom(vcpu, state, argp);
 	case KVM_HBT_GET_SNAPSHOT: {
 		struct kvm_hbt_snapshot_request req;
 

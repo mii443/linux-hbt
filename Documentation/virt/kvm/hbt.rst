@@ -5,8 +5,9 @@ Experimental HBT userspace #UD analysis
 
 This linux-hbt extension is a private #UD interface, not an upstream KVM ABI.
 The definitions in ``include/uapi/linux/kvm_hbt.h`` use private capability and
-exit number ``0x48425401``. No instruction decoding, candidate selection or
-patch installation is performed by this interface.
+exit number ``0x48425401``. Instruction decoding and candidate selection stay
+in userspace. A separately enabled XOM capability installs a supplied page
+image; it does not validate the replacement's instruction semantics.
 
 KVM_CAP_HBT_X86_UD
 ------------------
@@ -50,6 +51,56 @@ validated replacement guest code. It does not install code, reserve memory,
 validate replacement semantics or exclude userspace/DMA writers. The VMM owns
 those operations and must roll back its writes if acknowledgment fails. The
 default observation capability alone never permits RETRY.
+
+KVM_CAP_HBT_X86_XOM
+------------------
+
+:Architectures: x86 (VMX with EPT execute-only support)
+:Type: VM capability, private number 0x48425403
+:Parameters: args[0] = KVM_HBT_ABI_VERSION (1); args[1..3] and flags = 0
+
+Enable UD and RETRY first, then XOM before creating the sole vCPU. Unsupported
+parameters/backend or missing RETRY return EINVAL; an existing vCPU returns
+EBUSY. KVM_CHECK_EXTENSION returns 1 only with EPT execute-only support.
+This enables KVM_HBT_INSTALL_XOM and does not itself change any guest page.
+
+KVM_HBT_INSTALL_XOM
+------------------
+
+:Type: vCPU ioctl, private number 0xea
+:Parameters: struct kvm_hbt_xom_install (40 bytes)
+
+Set version=1, reserved=0, request_id to the pending #UD ID, and gpa to its
+aligned 4 KiB page base. original_addr and replacement_addr each point to
+4096 readable userspace bytes. The VMM must not pre-write the guest page.
+
+The ioctl revalidates the saved fault context and instruction-fetch GPA,
+compares the captured suffix with the supplied original, then compares the
+entire original with live RAM through a pinned writable mapping. Read-only,
+guest_memfd and non-pinnable mappings are rejected. It allocates all state
+before installing the full-page original and replacement, zaps stale SPTEs,
+and acknowledges RETRY. The next KVM_RUN executes at unchanged RIP. Every
+error leaves guest bytes and pending completion unchanged; no separate
+KVM_HBT_COMPLETE is needed after success.
+
+The translated page uses EPT R=0/W=0/X=1. Instruction fetch sees replacement
+bytes; emulated CPU data reads see the saved original. A CPU write restores
+the entire original before the write, removes all translation metadata for
+the page, and invalidates its SPTEs. Same-value writes and writes outside the
+patched ranges invalidate as well. Emulated standard writes, operand writes
+and compare/exchange follow the same rule. Later execution sees the guest's
+new bytes and may cause a fresh #UD analysis. A partial restore failure keeps
+the original and XOM metadata; the fault/emulation returns an error instead
+of allowing the guest write to continue.
+
+This is a single-vCPU, private-RAM prototype. The VMM must exclude DMA,
+userspace writers, aliases and memslot changes throughout the translation's
+lifetime, including reset/reinitialization. Such writers bypass EPT and are
+not intercepted. VM teardown frees the saved originals; migration and reset
+of an installed translation have no state protocol. Keep writable helper
+data on a different page. Only data accesses supported by KVM's instruction
+emulator are covered; arbitrary SIMD reads and full guest OS execution are
+not promised. Timing/debugger observability is not hidden.
 
 KVM_EXIT_HBT_X86_UD
 -------------------
@@ -104,10 +155,16 @@ this experimental interface has no migration state format.
 Errors
 ------
 
-Both ioctls return EOPNOTSUPP when the VM has not enabled the capability, and
+The ioctls return EOPNOTSUPP when the VM has not enabled the capability, and
 ENOENT when no request is pending. A mismatched ID returns ESTALE. Invalid
 version, buffer size, action or reserved field returns EINVAL. User-copy
 failures return EFAULT. Repeating a successful acknowledgment before KVM_RUN
 returns EALREADY. An invalid request does not consume or change pending state.
 RETRY without its separate capability returns EOPNOTSUPP; RETRY with a replaced
 fault context returns ESTALE. Undefined action values return EINVAL.
+
+INSTALL_XOM additionally returns EOPNOTSUPP without its own capability or
+without an ordinary pinned page, ESTALE for changed context/fetch translation
+or original bytes, EINVAL for a misaligned/wrong page or unsupported memslot,
+EBUSY for an existing XOM entry, and ENOMEM for allocation failures. A failed
+installation can be followed by normal FALLBACK completion.

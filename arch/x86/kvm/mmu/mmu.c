@@ -8177,7 +8177,67 @@ struct kvm_xom_patch {
 
 struct kvm_xom_entry {
 	struct list_head patches;
+	u8 *original_page;
 };
+
+/*
+ * The HBT caller holds SRCU and its sole vCPU stopped. The VMM must exclude
+ * memslot changes, DMA and other userspace writers for this private page.
+ * All fallible operations precede the copy through a pinned writable mapping.
+ */
+int kvm_install_xom_page(struct kvm_vcpu *vcpu, gpa_t gpa,
+			 const u8 *original, const u8 *replacement)
+{
+	struct kvm *kvm = vcpu->kvm;
+	struct kvm_xom_entry *entry;
+	struct kvm_host_map map;
+	struct kvm_memory_slot *slot;
+	gfn_t gfn = gpa_to_gfn(gpa);
+	int ret;
+
+	if (offset_in_page(gpa) || gfn > kvm_mmu_max_gfn())
+		return -EINVAL;
+	slot = kvm_vcpu_gfn_to_memslot(vcpu, gfn);
+	if (!slot || (slot->flags & (KVM_MEM_READONLY | KVM_MEM_GUEST_MEMFD)))
+		return -EINVAL;
+	entry = kzalloc_obj(*entry, GFP_KERNEL_ACCOUNT);
+	if (!entry)
+		return -ENOMEM;
+	entry->original_page = kmemdup(original, PAGE_SIZE, GFP_KERNEL_ACCOUNT);
+	if (!entry->original_page) {
+		kfree(entry);
+		return -ENOMEM;
+	}
+	INIT_LIST_HEAD(&entry->patches);
+	ret = kvm_vcpu_map(vcpu, gfn, &map);
+	if (ret)
+		goto free;
+	ret = -EOPNOTSUPP;
+	if (!map.pinned_page || !map.page)
+		goto unmap;
+
+	mutex_lock(&kvm->arch.xom.lock);
+	ret = -ESTALE;
+	if (memcmp(map.hva, original, PAGE_SIZE))
+		goto unlock;
+	ret = xa_insert(&kvm->arch.xom.gfns, gfn, entry, GFP_KERNEL_ACCOUNT);
+	if (ret)
+		goto unlock;
+	memcpy(map.hva, replacement, PAGE_SIZE);
+	entry = NULL; /* No failures after publishing the entry and page. */
+unlock:
+	mutex_unlock(&kvm->arch.xom.lock);
+unmap:
+	kvm_vcpu_unmap(vcpu, &map);
+free:
+	if (entry) {
+		kfree(entry->original_page);
+		kfree(entry);
+	}
+	if (!ret)
+		kvm_zap_gfn_range(kvm, gfn, gfn + 1);
+	return ret;
+}
 
 void kvm_xom_init(struct kvm *kvm)
 {
@@ -8197,6 +8257,7 @@ void kvm_xom_destroy(struct kvm *kvm)
 			list_del(&patch->node);
 			kfree(patch);
 		}
+		kfree(entry->original_page);
 		kfree(entry);
 	}
 
@@ -8232,7 +8293,7 @@ int kvm_mark_gfn_xom(struct kvm *kvm, gfn_t gfn, gpa_t patch_gpa,
 
 	entry = xa_load(&kvm->arch.xom.gfns, gfn);
 	if (!entry) {
-		new_entry = kmalloc(sizeof(*new_entry), GFP_KERNEL);
+		new_entry = kzalloc_obj(*new_entry, GFP_KERNEL);
 		if (!new_entry) {
 			ret = -ENOMEM;
 			goto out_unlock;
@@ -8246,6 +8307,10 @@ int kvm_mark_gfn_xom(struct kvm *kvm, gfn_t gfn, gpa_t patch_gpa,
 		}
 		entry = new_entry;
 		new_entry = NULL;
+	}
+	if (entry->original_page) {
+		ret = -EBUSY;
+		goto out_unlock;
 	}
 
 	list_for_each_entry(tmp, &entry->patches, node) {
@@ -8279,25 +8344,36 @@ int kvm_unmark_gfn_xom(struct kvm *kvm, gfn_t gfn)
 	int ret = 0;
 
 	mutex_lock(&kvm->arch.xom.lock);
-	entry = xa_erase(&kvm->arch.xom.gfns, gfn);
-	mutex_unlock(&kvm->arch.xom.lock);
-
+	entry = xa_load(&kvm->arch.xom.gfns, gfn);
 	if (!entry)
-		return 0;
+		goto unlock;
+	if (entry->original_page) {
+		ret = kvm_write_guest(kvm, gfn_to_gpa(gfn),
+				      entry->original_page, PAGE_SIZE);
+		if (ret)
+			goto unlock;
+	}
+	list_for_each_entry(patch, &entry->patches, node) {
+		ret = kvm_write_guest(kvm, patch->gpa, patch->original, patch->len);
+		if (ret)
+			goto unlock;
+	}
+	/*
+	 * Keep the original and XOM protection on restore failure. Never resume
+	 * the guest write with a partially restored executable page exposed.
+	 */
+	xa_erase(&kvm->arch.xom.gfns, gfn);
 
 	list_for_each_entry_safe(patch, tmp, &entry->patches, node) {
-		int r;
-
-		r = kvm_write_guest(kvm, patch->gpa, patch->original, patch->len);
-		if (r && !ret)
-			ret = r;
-
 		list_del(&patch->node);
 		kfree(patch);
 	}
+	kfree(entry->original_page);
 	kfree(entry);
-
-	kvm_zap_gfn_range(kvm, gfn, gfn + 1);
+unlock:
+	mutex_unlock(&kvm->arch.xom.lock);
+	if (!ret)
+		kvm_zap_gfn_range(kvm, gfn, gfn + 1);
 	return ret;
 }
 EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_unmark_gfn_xom);
@@ -8350,6 +8426,8 @@ int kvm_vcpu_read_xom_guest(struct kvm_vcpu *vcpu, gpa_t gpa, void *data,
 		mutex_lock(&kvm->arch.xom.lock);
 		entry = xa_load(&kvm->arch.xom.gfns, gfn);
 		if (entry) {
+			if (entry->original_page)
+				memcpy(buf, entry->original_page + offset, bytes);
 			list_for_each_entry(patch, &entry->patches, node)
 				kvm_xom_copy_patch_original(patch, cur_gpa,
 							    buf, bytes);

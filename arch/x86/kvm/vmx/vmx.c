@@ -8816,6 +8816,7 @@ __init int vmx_hardware_setup(void)
 	kvm_caps.has_bus_lock_exit = cpu_has_vmx_bus_lock_detection();
 	kvm_caps.has_notify_vmexit = cpu_has_notify_vmexit();
 	kvm_caps.has_hbt_ud = true;
+	kvm_caps.has_hbt_xom = enable_ept && cpu_has_vmx_ept_execute_only();
 
 	set_bit(0, vmx_vpid_bitmap); /* 0 is reserved for host */
 
