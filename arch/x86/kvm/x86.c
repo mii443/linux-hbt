@@ -4883,6 +4883,7 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
 			r = KVM_HBT_ABI_VERSION;
 		break;
 	case KVM_CAP_HBT_X86_XOM:
+	case KVM_CAP_HBT_X86_XOM_UPDATE:
 		if (kvm_caps.has_hbt_xom &&
 		    (!kvm || kvm->arch.vm_type == KVM_X86_DEFAULT_VM))
 			r = KVM_HBT_ABI_VERSION;
@@ -6240,6 +6241,8 @@ long kvm_arch_vcpu_ioctl(struct file *filp,
 		break;
 	case KVM_HBT_INSTALL_XOM:
 	case KVM_HBT_TRANSLATE_RW:
+	case KVM_HBT_GET_XOM_PAGE:
+	case KVM_HBT_UPDATE_XOM:
 		kvm_vcpu_srcu_read_lock(vcpu);
 		r = kvm_hbt_ioctl(vcpu, ioctl, argp);
 		kvm_vcpu_srcu_read_unlock(vcpu);

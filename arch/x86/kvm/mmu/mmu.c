@@ -8175,7 +8175,106 @@ struct kvm_xom_patch {
 struct kvm_xom_entry {
 	struct list_head patches;
 	u8 *original_page;
+	u64 generation;
 };
+
+int kvm_get_xom_page(struct kvm_vcpu *vcpu, gpa_t gpa,
+		     u8 *original, u8 *current_image, u64 *generation)
+{
+	struct kvm *kvm = vcpu->kvm;
+	struct kvm_xom_entry *entry;
+	int ret;
+
+	if (offset_in_page(gpa) || gpa_to_gfn(gpa) > kvm_mmu_max_gfn())
+		return -EINVAL;
+	mutex_lock(&kvm->arch.xom.lock);
+	entry = xa_load(&kvm->arch.xom.gfns, gpa_to_gfn(gpa));
+	ret = -EOPNOTSUPP;
+	/* Legacy entries have no generation and cannot be updated through v2. */
+	if (entry && (!entry->original_page || !entry->generation))
+		goto out;
+	ret = kvm_vcpu_read_guest(vcpu, gpa, current_image, PAGE_SIZE);
+	if (ret)
+		goto out;
+	memcpy(original, entry ? entry->original_page : current_image, PAGE_SIZE);
+	*generation = entry ? entry->generation : 0;
+out:
+	mutex_unlock(&kvm->arch.xom.lock);
+	return ret;
+}
+
+/* Compare expected generation AND current_image bytes before replacing a page.
+ * The first original survives all updates; a guest write retires the entry.
+ */
+int kvm_update_xom_page(struct kvm_vcpu *vcpu, gpa_t gpa, u64 expected_generation,
+			u64 generation, const u8 *original, const u8 *current_image,
+			const u8 *replacement)
+{
+	struct kvm *kvm = vcpu->kvm;
+	struct kvm_xom_entry *entry, *new_entry = NULL;
+	struct kvm_memory_slot *slot;
+	struct kvm_host_map map;
+	gfn_t gfn = gpa_to_gfn(gpa);
+	int ret;
+
+	if (offset_in_page(gpa) || gfn > kvm_mmu_max_gfn() || !generation ||
+	    generation <= expected_generation)
+		return -EINVAL;
+	slot = kvm_vcpu_gfn_to_memslot(vcpu, gfn);
+	if (!slot || (slot->flags & (KVM_MEM_READONLY | KVM_MEM_GUEST_MEMFD)))
+		return -EINVAL;
+	if (!expected_generation) {
+		new_entry = kzalloc_obj(*new_entry, GFP_KERNEL_ACCOUNT);
+		if (!new_entry)
+			return -ENOMEM;
+		new_entry->original_page = kmemdup(original, PAGE_SIZE, GFP_KERNEL_ACCOUNT);
+		if (!new_entry->original_page) {
+			kfree(new_entry);
+			return -ENOMEM;
+		}
+		INIT_LIST_HEAD(&new_entry->patches);
+	}
+	ret = kvm_vcpu_map(vcpu, gfn, &map);
+	if (ret)
+		goto free;
+	ret = -EOPNOTSUPP;
+	if (!map.pinned_page || !map.page)
+		goto unmap;
+	mutex_lock(&kvm->arch.xom.lock);
+	entry = xa_load(&kvm->arch.xom.gfns, gfn);
+	ret = -ESTALE;
+	if (memcmp(map.hva, current_image, PAGE_SIZE))
+		goto unlock;
+	if (expected_generation) {
+		if (!entry || !entry->original_page || entry->generation != expected_generation ||
+		    memcmp(entry->original_page, original, PAGE_SIZE))
+			goto unlock;
+	} else {
+		if (entry || memcmp(original, current_image, PAGE_SIZE))
+			goto unlock;
+		ret = xa_insert(&kvm->arch.xom.gfns, gfn, new_entry, GFP_KERNEL_ACCOUNT);
+		if (ret)
+			goto unlock;
+		entry = new_entry;
+		new_entry = NULL;
+	}
+	/* No failure after publication. Request IDs survive vCPU reset. */
+	entry->generation = generation;
+	memcpy(map.hva, replacement, PAGE_SIZE);
+	ret = 0;
+unlock:
+	mutex_unlock(&kvm->arch.xom.lock);
+unmap:
+	kvm_vcpu_unmap(vcpu, &map);
+free:
+	if (new_entry) {
+		kfree(new_entry->original_page);
+		kfree(new_entry);
+	}
+	if (!ret)
+		kvm_zap_gfn_range(kvm, gfn, gfn + 1);
+	return ret;
+}
 
 /*
  * The HBT caller holds SRCU and its sole vCPU stopped. The VMM must exclude

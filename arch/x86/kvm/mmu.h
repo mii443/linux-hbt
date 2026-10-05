@@ -87,6 +87,11 @@ void kvm_xom_init(struct kvm *kvm);
 void kvm_xom_destroy(struct kvm *kvm);
 int kvm_install_xom_page(struct kvm_vcpu *vcpu, gpa_t gpa,
 			 const u8 *original, const u8 *replacement);
+int kvm_get_xom_page(struct kvm_vcpu *vcpu, gpa_t gpa,
+		     u8 *original, u8 *current_image, u64 *generation);
+int kvm_update_xom_page(struct kvm_vcpu *vcpu, gpa_t gpa, u64 expected_generation,
+			u64 generation, const u8 *original, const u8 *current_image,
+			const u8 *replacement);
 int kvm_mark_gfn_xom(struct kvm *kvm, gfn_t gfn, gpa_t patch_gpa,
 		     const u8 *original, u8 len);
 int kvm_unmark_gfn_xom(struct kvm *kvm, gfn_t gfn);

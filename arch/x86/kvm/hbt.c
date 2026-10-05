@@ -104,7 +104,7 @@ bool kvm_hbt_prepare_ud(struct kvm_vcpu *vcpu)
 	s->cr3 = kvm_read_cr3(vcpu);
 	s->mode = mode;
 	s->data_len = KVM_HBT_MAX_BYTES - offset_in_page(linear);
-	if (kvm_vcpu_read_guest(vcpu, gpa, s->data, s->data_len)) {
+	if (kvm_vcpu_read_xom_guest(vcpu, gpa, s->data, s->data_len)) {
 		kfree(state);
 		return false;
 	}
@@ -169,6 +169,90 @@ out:
 	return ret;
 }
 
+static int kvm_hbt_xom_request(struct kvm_vcpu *vcpu, struct kvm_hbt_state *state,
+			       u32 version, u32 reserved, u64 id, gpa_t gpa)
+{
+	struct x86_exception exception = {};
+	struct kvm_hbt_snapshot *s = &state->snapshot;
+
+	if (version != KVM_HBT_ABI_VERSION || reserved || offset_in_page(gpa) ||
+	    gpa != (s->gpa & PAGE_MASK))
+		return -EINVAL;
+	if (id != s->request_id || !kvm_hbt_same_context(vcpu, state) ||
+	    kvm_mmu_gva_to_gpa_fetch(vcpu, s->linear_rip, &exception) != s->gpa)
+		return -ESTALE;
+	return state->acknowledged ? -EALREADY : 0;
+}
+
+static int kvm_hbt_get_xom_page(struct kvm_vcpu *vcpu,
+				struct kvm_hbt_state *state, void __user *argp)
+{
+	struct kvm_hbt_xom_page req;
+	u8 *images;
+	int ret;
+
+	if (!vcpu->kvm->arch.hbt_xom_enabled)
+		return -EOPNOTSUPP;
+	if (copy_from_user(&req, argp, sizeof(req)))
+		return -EFAULT;
+	if (req.generation)
+		return -EINVAL;
+	ret = kvm_hbt_xom_request(vcpu, state, req.version, req.reserved,
+				  req.request_id, req.gpa);
+	if (ret)
+		return ret;
+	images = kmalloc(2 * PAGE_SIZE, GFP_KERNEL_ACCOUNT);
+	if (!images)
+		return -ENOMEM;
+	ret = kvm_get_xom_page(vcpu, req.gpa, images, images + PAGE_SIZE, &req.generation);
+	if (!ret && (copy_to_user(u64_to_user_ptr(req.original_addr), images, PAGE_SIZE) ||
+		     copy_to_user(u64_to_user_ptr(req.current_addr),
+				  images + PAGE_SIZE, PAGE_SIZE) ||
+		     copy_to_user(argp, &req, sizeof(req))))
+		ret = -EFAULT;
+	kfree(images);
+	return ret;
+}
+
+static int kvm_hbt_update_xom(struct kvm_vcpu *vcpu,
+			      struct kvm_hbt_state *state, void __user *argp)
+{
+	struct kvm_hbt_xom_update req;
+	struct kvm_hbt_snapshot *s = &state->snapshot;
+	u8 *images;
+	int ret;
+
+	if (!vcpu->kvm->arch.hbt_xom_enabled)
+		return -EOPNOTSUPP;
+	if (copy_from_user(&req, argp, sizeof(req)))
+		return -EFAULT;
+	ret = kvm_hbt_xom_request(vcpu, state, req.version, req.reserved,
+				  req.request_id, req.gpa);
+	if (ret)
+		return ret;
+	images = kmalloc(3 * PAGE_SIZE, GFP_KERNEL_ACCOUNT);
+	if (!images)
+		return -ENOMEM;
+	ret = -EFAULT;
+	if (copy_from_user(images, u64_to_user_ptr(req.original_addr), PAGE_SIZE) ||
+	    copy_from_user(images + PAGE_SIZE, u64_to_user_ptr(req.current_addr), PAGE_SIZE) ||
+	    copy_from_user(images + 2 * PAGE_SIZE,
+			   u64_to_user_ptr(req.replacement_addr), PAGE_SIZE))
+		goto out;
+	ret = -ESTALE;
+	if (memcmp(images + offset_in_page(s->gpa), s->data, s->data_len))
+		goto out;
+	ret = kvm_update_xom_page(vcpu, req.gpa, req.expected_generation, req.request_id,
+				  images, images + PAGE_SIZE, images + 2 * PAGE_SIZE);
+	if (!ret) {
+		state->retry = true;
+		state->acknowledged = true;
+	}
+out:
+	kfree(images);
+	return ret;
+}
+
 long kvm_hbt_ioctl(struct kvm_vcpu *vcpu, unsigned int cmd, void __user *argp)
 {
 	struct kvm_hbt_state *state = vcpu->arch.hbt;
@@ -179,6 +263,10 @@ long kvm_hbt_ioctl(struct kvm_vcpu *vcpu, unsigned int cmd, void __user *argp)
 		return -ENOENT;
 
 	switch (cmd) {
+	case KVM_HBT_GET_XOM_PAGE:
+		return kvm_hbt_get_xom_page(vcpu, state, argp);
+	case KVM_HBT_UPDATE_XOM:
+		return kvm_hbt_update_xom(vcpu, state, argp);
 	case KVM_HBT_TRANSLATE_RW: {
 		struct kvm_hbt_translation req;
 		struct x86_exception exception = {};

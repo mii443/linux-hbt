@@ -62,8 +62,61 @@ KVM_CAP_HBT_X86_XOM
 Enable UD and RETRY first, then XOM before creating the sole vCPU. Unsupported
 parameters/backend or missing RETRY return EINVAL; an existing vCPU returns
 EBUSY. KVM_CHECK_EXTENSION returns 1 only with EPT execute-only support.
-This enables KVM_HBT_INSTALL_XOM and KVM_HBT_TRANSLATE_RW, and does not itself
-change any guest page.
+This enables KVM_HBT_INSTALL_XOM, KVM_HBT_TRANSLATE_RW and the generation-checked
+page query/update interface below. It does not itself change any guest page.
+
+KVM_CAP_HBT_X86_XOM_UPDATE
+--------------------------
+
+:Architectures: x86 (VMX with EPT execute-only support)
+:Type: Query-only capability, private number 0x48425404
+
+KVM_CHECK_EXTENSION returns ABI version 1 when the page query/update interface
+is available. There is no separate ENABLE_CAP operation; enable XOM as above.
+The original INSTALL ioctl remains available for old callers. Its entries do
+not carry generations and cannot be updated by this interface.
+
+KVM_HBT_GET_XOM_PAGE
+--------------------
+
+:Type: vCPU ioctl, private number 0xec
+:Parameters: struct kvm_hbt_xom_page (48 bytes, input/output)
+
+Set version=1, reserved=0, request_id to the pending unacknowledged #UD ID,
+gpa to the aligned faulting page, and generation=0. original_addr and
+current_addr point to writable userspace buffers of 4096 bytes each. With
+the fault context and fetch GPA revalidated, the ioctl copies the first
+original page, current live replacement and generation under the XOM lock.
+Generation zero means no translation, in which case both images match.
+A legacy entry returns EOPNOTSUPP. Copy errors return EFAULT and do not
+acknowledge the request or change the guest. Treat any failed output as invalid.
+
+KVM_HBT_UPDATE_XOM
+------------------
+
+:Type: vCPU ioctl, private number 0xed
+:Parameters: struct kvm_hbt_xom_update (56 bytes, input only)
+
+Set version=1, reserved=0, request_id and gpa as above, expected_generation
+from GET_XOM_PAGE, and original_addr/current_addr/replacement_addr to readable
+4096-byte images. expected_generation=0 requests the first installation and
+requires original=current. The captured instruction suffix is checked against
+original, which is also the source for later #UD snapshots on translated pages.
+
+The operation compares the generation, saved original and full current image
+against a pinned writable RAM page under the XOM lock. Mismatched generation
+or images return ESTALE. Invalid alignment, generation ordering or RAM slot
+returns EINVAL; unsupported pinning returns EOPNOTSUPP. All allocation and
+copy failures precede publication and leave guest bytes and completion intact.
+
+Success preserves the first original, installs the complete replacement,
+sets generation=request_id, invalidates SPTEs and acknowledges RETRY. There
+is no userspace output copy after publication and no separate completion is
+needed. The VMM may compose multiple helpers in this replacement. A guest
+write restores the first original and retires every helper/generation on the
+page; an update with a retired generation returns ESTALE even if bytes happen
+to match again. Request IDs survive vCPU reset. The same single-vCPU,
+stable-private-RAM and writer-exclusion contract as INSTALL_XOM applies.
 
 KVM_HBT_TRANSLATE_RW
 --------------------

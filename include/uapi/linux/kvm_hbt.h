@@ -9,6 +9,7 @@
 #define KVM_CAP_HBT_X86_UD	0x48425401
 #define KVM_CAP_HBT_X86_RETRY	0x48425402
 #define KVM_CAP_HBT_X86_XOM	0x48425403
+#define KVM_CAP_HBT_X86_XOM_UPDATE 0x48425404 /* Query only; enabled with XOM. */
 #define KVM_EXIT_HBT_X86_UD	0x48425401
 #define KVM_HBT_ABI_VERSION	1
 #define KVM_HBT_MAX_BYTES	4096
@@ -77,6 +78,36 @@ struct kvm_hbt_translation {
 	__u64 physical_address; /* Output; input must be zero. */
 };
 
+/*
+ * Read the original/current page and generation while a #UD is pending.
+ * generation is output (zero on input); zero means no installed translation.
+ */
+struct kvm_hbt_xom_page {
+	__u32 version;
+	__u32 reserved;
+	__u64 request_id;
+	__u64 gpa;
+	__u64 original_addr;
+	__u64 current_addr;
+	__u64 generation;
+};
+
+/*
+ * Compare-and-replace an entire page; preserve its first original. Success
+ * sets generation=request_id and acknowledges RETRY. No output copy can fail
+ * after publication. A write/discard makes every previous generation stale.
+ */
+struct kvm_hbt_xom_update {
+	__u32 version;
+	__u32 reserved;
+	__u64 request_id;
+	__u64 gpa;
+	__u64 expected_generation;
+	__u64 original_addr;
+	__u64 current_addr;
+	__u64 replacement_addr;
+};
+
 /* Private vCPU ioctls. KVMIO is 0xae; keep this header self-contained. */
 #define KVM_HBT_GET_SNAPSHOT \
 	_IOW(0xae, 0xe8, struct kvm_hbt_snapshot_request)
@@ -86,5 +117,9 @@ struct kvm_hbt_translation {
 	_IOW(0xae, 0xea, struct kvm_hbt_xom_install)
 #define KVM_HBT_TRANSLATE_RW \
 	_IOWR(0xae, 0xeb, struct kvm_hbt_translation)
+#define KVM_HBT_GET_XOM_PAGE \
+	_IOWR(0xae, 0xec, struct kvm_hbt_xom_page)
+#define KVM_HBT_UPDATE_XOM \
+	_IOW(0xae, 0xed, struct kvm_hbt_xom_update)
 
 #endif /* _UAPI_LINUX_KVM_HBT_H */
