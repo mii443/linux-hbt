@@ -62,7 +62,34 @@ KVM_CAP_HBT_X86_XOM
 Enable UD and RETRY first, then XOM before creating the sole vCPU. Unsupported
 parameters/backend or missing RETRY return EINVAL; an existing vCPU returns
 EBUSY. KVM_CHECK_EXTENSION returns 1 only with EPT execute-only support.
-This enables KVM_HBT_INSTALL_XOM and does not itself change any guest page.
+This enables KVM_HBT_INSTALL_XOM and KVM_HBT_TRANSLATE_RW, and does not itself
+change any guest page.
+
+KVM_HBT_TRANSLATE_RW
+--------------------
+
+:Type: vCPU ioctl, private number 0xeb
+:Parameters: struct kvm_hbt_translation (32 bytes, input/output)
+
+Set version=1, reserved=0, physical_address=0, request_id to the pending #UD
+ID, and linear_address to a page-aligned guest data address. The ioctl
+requires the XOM capability and an unacknowledged request with unchanged
+fault context. It walks guest page tables with write access at the current
+CPL, including the user-access check at CPL3, and returns physical_address.
+It does not inject a page fault, acknowledge the request or install code.
+The page walk can update page-table accessed/dirty bits.
+
+The caller must validate the returned GPA against writable ordinary RAM and
+keep mappings/content stable. Translation alone does not pin guest page
+tables, establish ownership or guarantee a future access will succeed.
+The cooperative 64-bit Linux demo uses this to validate a separate resident
+data page; its code GPA is captured with instruction-fetch permissions.
+The ordinary KVM_TRANSLATE system-access walk is insufficient for this check.
+
+Invalid alignment or nonzero input physical_address returns EINVAL; an
+inaccessible mapping or user-copy failure returns EFAULT. A mismatched ID or
+changed fault context returns ESTALE; an acknowledged request returns
+EALREADY. Failure leaves the request available for normal FALLBACK completion.
 
 KVM_HBT_INSTALL_XOM
 ------------------
@@ -99,8 +126,10 @@ lifetime, including reset/reinitialization. Such writers bypass EPT and are
 not intercepted. VM teardown frees the saved originals; migration and reset
 of an installed translation have no state protocol. Keep writable helper
 data on a different page. Only data accesses supported by KVM's instruction
-emulator are covered; arbitrary SIMD reads and full guest OS execution are
-not promised. Timing/debugger observability is not hidden.
+emulator are covered; arbitrary SIMD reads and transparent guest OS integration
+are not promised. A cooperative Linux process with resident private pages is
+tested, but fork/remapping and architectural ZMM signal/XSAVE state are not
+virtualized. Timing/debugger observability is not hidden.
 
 KVM_EXIT_HBT_X86_UD
 -------------------

@@ -179,6 +179,29 @@ long kvm_hbt_ioctl(struct kvm_vcpu *vcpu, unsigned int cmd, void __user *argp)
 		return -ENOENT;
 
 	switch (cmd) {
+	case KVM_HBT_TRANSLATE_RW: {
+		struct kvm_hbt_translation req;
+		struct x86_exception exception = {};
+		gpa_t gpa;
+
+		if (!vcpu->kvm->arch.hbt_xom_enabled)
+			return -EOPNOTSUPP;
+		if (copy_from_user(&req, argp, sizeof(req)))
+			return -EFAULT;
+		if (req.version != KVM_HBT_ABI_VERSION || req.reserved ||
+		    req.physical_address || offset_in_page(req.linear_address))
+			return -EINVAL;
+		if (req.request_id != state->snapshot.request_id ||
+		    !kvm_hbt_same_context(vcpu, state))
+			return -ESTALE;
+		if (state->acknowledged)
+			return -EALREADY;
+		gpa = kvm_mmu_gva_to_gpa_write(vcpu, req.linear_address, &exception);
+		if (gpa == INVALID_GPA)
+			return -EFAULT;
+		req.physical_address = gpa;
+		return copy_to_user(argp, &req, sizeof(req)) ? -EFAULT : 0;
+	}
 	case KVM_HBT_INSTALL_XOM:
 		return kvm_hbt_install_xom(vcpu, state, argp);
 	case KVM_HBT_GET_SNAPSHOT: {

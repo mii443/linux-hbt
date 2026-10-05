@@ -5543,10 +5543,7 @@ static inline bool boot_cpu_is_amd(void)
 	return shadow_x_mask == 0;
 }
 
-/*
- * the direct page table on host, use as much mmu features as
- * possible, however, kvm currently does not do execution-protection.
- */
+/* Validate direct SPTEs against the host capabilities, including HBT XOM. */
 static void reset_tdp_shadow_zero_bits_mask(struct kvm_mmu *context)
 {
 	struct rsvd_bits_validate *shadow_zero_check;
@@ -5561,7 +5558,7 @@ static void reset_tdp_shadow_zero_bits_mask(struct kvm_mmu *context)
 					false, true);
 	else
 		__reset_rsvds_bits_mask_ept(shadow_zero_check,
-					    reserved_hpa_bits(), false,
+					    reserved_hpa_bits(), kvm_caps.has_hbt_xom,
 					    max_huge_page_level);
 
 	if (!shadow_me_mask)

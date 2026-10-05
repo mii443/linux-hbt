@@ -6239,6 +6239,7 @@ long kvm_arch_vcpu_ioctl(struct file *filp,
 		r = kvm_hbt_ioctl(vcpu, ioctl, argp);
 		break;
 	case KVM_HBT_INSTALL_XOM:
+	case KVM_HBT_TRANSLATE_RW:
 		kvm_vcpu_srcu_read_lock(vcpu);
 		r = kvm_hbt_ioctl(vcpu, ioctl, argp);
 		kvm_vcpu_srcu_read_unlock(vcpu);

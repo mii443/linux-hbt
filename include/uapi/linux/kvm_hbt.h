@@ -65,6 +65,18 @@ struct kvm_hbt_xom_install {
 	__u64 replacement_addr;
 };
 
+/*
+ * Translate a page for data reads/writes at the faulting context's CPL.
+ * Valid only while an XOM-enabled #UD request is pending, before completion.
+ */
+struct kvm_hbt_translation {
+	__u32 version;
+	__u32 reserved;
+	__u64 request_id;
+	__u64 linear_address;
+	__u64 physical_address; /* Output; input must be zero. */
+};
+
 /* Private vCPU ioctls. KVMIO is 0xae; keep this header self-contained. */
 #define KVM_HBT_GET_SNAPSHOT \
 	_IOW(0xae, 0xe8, struct kvm_hbt_snapshot_request)
@@ -72,5 +84,7 @@ struct kvm_hbt_xom_install {
 	_IOW(0xae, 0xe9, struct kvm_hbt_completion)
 #define KVM_HBT_INSTALL_XOM \
 	_IOW(0xae, 0xea, struct kvm_hbt_xom_install)
+#define KVM_HBT_TRANSLATE_RW \
+	_IOWR(0xae, 0xeb, struct kvm_hbt_translation)
 
 #endif /* _UAPI_LINUX_KVM_HBT_H */
