@@ -15,6 +15,7 @@
  * be __static_call_return0.
  */
 KVM_X86_OP(check_processor_compatibility)
+KVM_X86_OP_OPTIONAL(hbt_eptp_probe)
 KVM_X86_OP(enable_virtualization_cpu)
 KVM_X86_OP(disable_virtualization_cpu)
 KVM_X86_OP(hardware_unsetup)

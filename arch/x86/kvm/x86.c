@@ -6249,6 +6249,10 @@ long kvm_arch_vcpu_ioctl(struct file *filp,
 
 	u.buffer = NULL;
 	switch (ioctl) {
+	case KVM_HBT_EPTP_PROBE:
+		r = kvm_x86_ops.hbt_eptp_probe ?
+			kvm_x86_call(hbt_eptp_probe)(vcpu, argp) : -EOPNOTSUPP;
+		break;
 	case KVM_HBT_GET_XSTATE:
 	case KVM_HBT_SET_XSTATE:
 		r = kvm_hbt_xstate_ioctl(vcpu, ioctl, argp);

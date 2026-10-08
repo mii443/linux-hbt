@@ -6103,6 +6103,11 @@ static int handle_invalid_guest_state(struct kvm_vcpu *vcpu)
 
 int vmx_vcpu_pre_run(struct kvm_vcpu *vcpu)
 {
+	if (unlikely(to_vmx(vcpu)->hbt_eptp) &&
+	    (irqchip_in_kernel(vcpu->kvm) || is_smm(vcpu) ||
+	     is_guest_mode(vcpu) || to_vmx(vcpu)->nested.vmxon))
+		return -EOPNOTSUPP;
+
 	if (vmx_unhandleable_emulation_required(vcpu)) {
 		kvm_prepare_emulation_failure_exit(vcpu);
 		return 0;
@@ -6971,7 +6976,11 @@ unexpected_vmexit:
 
 int vmx_handle_exit(struct kvm_vcpu *vcpu, fastpath_t exit_fastpath)
 {
-	int ret = __vmx_handle_exit(vcpu, exit_fastpath);
+	int ret;
+
+	if (unlikely(to_vmx(vcpu)->hbt_eptp))
+		return vmx_hbt_eptp_exit(to_vmx(vcpu));
+	ret = __vmx_handle_exit(vcpu, exit_fastpath);
 
 	/*
 	 * Exit to user space when bus lock detected to inform that there is
@@ -7730,8 +7739,12 @@ fastpath_t vmx_vcpu_run(struct kvm_vcpu *vcpu, u64 run_flags)
 
 	kvm_wait_lapic_expire(vcpu);
 
+	if (unlikely(vmx->hbt_eptp))
+		vmx_hbt_eptp_enter(vmx);
 	/* The actual VMENTER/EXIT is in the .noinstr.text section. */
 	vmx_vcpu_enter_exit(vcpu, __vmx_vcpu_run_flags(vmx));
+	if (unlikely(vmx->hbt_eptp))
+		vmx_hbt_eptp_leave(vmx);
 
 	/* All fields are clean at this point */
 	if (kvm_is_using_evmcs()) {
@@ -7787,6 +7800,8 @@ fastpath_t vmx_vcpu_run(struct kvm_vcpu *vcpu, u64 run_flags)
 	vmx_recover_nmi_blocking(vmx);
 	vmx_complete_interrupts(vmx);
 
+	if (unlikely(vmx->hbt_eptp))
+		return EXIT_FASTPATH_NONE;
 	return vmx_exit_handlers_fastpath(vcpu, force_immediate_exit);
 }
 
@@ -7794,6 +7809,7 @@ void vmx_vcpu_free(struct kvm_vcpu *vcpu)
 {
 	struct vcpu_vmx *vmx = to_vmx(vcpu);
 
+	vmx_hbt_eptp_free(vmx);
 	if (enable_pml)
 		vmx_destroy_pml_buffer(vmx);
 	free_vpid(vmx->vpid);

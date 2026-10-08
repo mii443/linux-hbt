@@ -871,6 +871,7 @@ static int vt_gmem_max_mapping_level(struct kvm *kvm, kvm_pfn_t pfn,
 
 struct kvm_x86_ops vt_x86_ops __initdata = {
 	.name = KBUILD_MODNAME,
+	.hbt_eptp_probe = vmx_hbt_eptp_probe,
 
 	.check_processor_compatibility = vmx_check_processor_compat,
 

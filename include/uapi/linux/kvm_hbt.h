@@ -150,4 +150,44 @@ struct kvm_hbt_xstate {
 #define KVM_HBT_SET_XSTATE \
 	_IOW(0xae, 0xef, struct kvm_hbt_xstate)
 
+/*
+ * Bounded VMX laboratory interface, NOT a migratable RAM/translation API.
+ * CONFIG copies nr_pages of RAM at GPA 0 and up to 16 private helper pages.
+ * Other pages are shared by the two EPT views. READ copies one complete view.
+ * Every hardware exit is returned without guest instruction emulation:
+ * run->internal.suberror = raw VMX exit reason; data[0..4] = view,
+ * qualification, instruction length, interrupt information, guest RIP.
+ * No physical addresses are accepted from or returned to userspace.
+ */
+#define KVM_HBT_EPTP_VERSION 1
+#define KVM_HBT_EPTP_QUERY 0
+#define KVM_HBT_EPTP_CONFIG 1
+#define KVM_HBT_EPTP_READ 2
+#define KVM_HBT_EPTP_DESTROY 3
+#define KVM_HBT_EPTP_MAX_PAGES 512
+#define KVM_HBT_EPTP_MAX_OVERLAYS 16
+#define KVM_HBT_EPTP_UNDER_HYPERVISOR 1 /* QUERY output; timing is not L0 evidence */
+#define KVM_EXIT_HBT_EPTP 0x48425402
+
+struct kvm_hbt_eptp_overlay {
+	__u32 page;
+	__u32 reserved;
+	__u64 image_addr;
+};
+
+struct kvm_hbt_eptp_probe {
+	__u32 version;
+	__u32 operation;
+	__u32 nr_pages;
+	__u32 view;
+	__u64 image_addr;
+	__u64 overlays_addr;
+	__u32 nr_overlays;
+	__u32 flags;
+	__u64 reserved[3];
+};
+
+#define KVM_HBT_EPTP_PROBE \
+	_IOWR(0xae, 0xf0, struct kvm_hbt_eptp_probe)
+
 #endif /* _UAPI_LINUX_KVM_HBT_H */

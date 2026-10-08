@@ -9,6 +9,42 @@ state. A bounded integer VEX/EVEX executor and the parent repository's QEMU
 integration now support native AVX-512 -> AVX2/HBT live migration of the
 validation guest, including re-export after software execution.
 
+Bounded EPTP-switching experiment
+--------------------------------
+
+``kvm_intel.hbt_eptp_probe=1`` enables the private ``KVM_HBT_EPTP_PROBE``
+vCPU ioctl declared in ``linux/kvm_hbt.h``. It defaults off and requires Intel
+EPT, VPID and VMFUNC function 0 support. It is a test RAM backend: CONFIG copies
+at most 512 pages at GPA zero into accounted kernel-owned pages, with at most
+16 overlays for a second execution view. It does not pin memslot PFNs, accept
+host physical addresses, or replace normal KVM memory management. Each vCPU
+owns an independent image. In-kernel IRQ chips, SMM and nested VMX guests
+are excluded. Tests may themselves run under L0 nested virtualization, but
+QUERY labels that environment and its performance is not a native measurement.
+
+The two EPT roots and function control are installed only around hardware
+entry and restored immediately after hardware exit. All guest exceptions are
+intercepted, PML and EPT #VE are disabled during entry, and all exits return
+to the test driver without normal instruction-exit emulation. READ returns
+one complete copied RAM view; DESTROY releases the private pages and restores
+ordinary execution on the next KVM_RUN. Exits use ``KVM_EXIT_HBT_EPTP`` and
+``run->internal`` as documented in the UAPI header. Interpret instruction
+length, qualification and interruption fields only for exit reasons that
+define them. The active view persists across KVM_RUN calls.
+
+The parent repository's ``kernel-work/tests/test-hbt-eptp.py`` supplies known
+guest page tables, transition gates and register scratch. It exercises the
+existing SSE2 generator and explicitly joins its shadow to canonical XSTATE
+at stopped normal-instruction boundaries, then checks guest XSAVE and transfer
+to another vCPU. This is not automatic fault/interrupt recovery, a migration
+API, or transparent instrumentation of arbitrary guest code. Ordinary guest
+XSAVE emulation must run after the probe is destroyed and canonical state
+is restored. Production integration still needs mapping lifetime, guest RAM
+coherence, precise event handling and automatic state ownership transitions.
+
+Canonical XSTATE representation
+------------------------------
+
 The normalized state holds x87/SSE, YMM_Hi128, opmask, ZMM_Hi256 and Hi16_ZMM.
 The caller supplies the virtual CPUID.0D layout and MXCSR mask. Standard
 offsets may differ from the host; compacted offsets are calculated from

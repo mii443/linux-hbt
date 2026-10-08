@@ -200,6 +200,7 @@ struct nested_vmx {
 struct vcpu_vmx {
 	struct kvm_vcpu       vcpu;
 	struct vcpu_vt	      vt;
+	struct vmx_hbt_eptp   *hbt_eptp;
 	u8                    fail;
 	u8		      x2apic_msr_bitmap_mode;
 
@@ -353,6 +354,11 @@ int vmx_set_efer(struct kvm_vcpu *vcpu, u64 efer);
 void vmx_set_cr0(struct kvm_vcpu *vcpu, unsigned long cr0);
 void vmx_set_cr4(struct kvm_vcpu *vcpu, unsigned long cr4);
 void set_cr4_guest_host_mask(struct vcpu_vmx *vmx);
+long vmx_hbt_eptp_probe(struct kvm_vcpu *vcpu, void __user *argp);
+void vmx_hbt_eptp_free(struct vcpu_vmx *vmx);
+void vmx_hbt_eptp_enter(struct vcpu_vmx *vmx);
+void vmx_hbt_eptp_leave(struct vcpu_vmx *vmx);
+int vmx_hbt_eptp_exit(struct vcpu_vmx *vmx);
 void ept_save_pdptrs(struct kvm_vcpu *vcpu);
 void vmx_get_segment(struct kvm_vcpu *vcpu, struct kvm_segment *var, int seg);
 void __vmx_set_segment(struct kvm_vcpu *vcpu, struct kvm_segment *var, int seg);

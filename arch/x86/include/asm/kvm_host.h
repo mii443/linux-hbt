@@ -1775,6 +1775,7 @@ enum kvm_x86_run_flags {
 
 struct kvm_x86_ops {
 	const char *name;
+	long (*hbt_eptp_probe)(struct kvm_vcpu *vcpu, void __user *argp);
 
 	int (*check_processor_compatibility)(void);
 
