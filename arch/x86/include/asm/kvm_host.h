@@ -948,6 +948,7 @@ struct kvm_vcpu_arch {
 	int cui_rdmsr_imm_reg;
 	struct kvm_hbt_state *hbt;
 	u64 hbt_request_id;
+	struct kvm_hbt_xstate *hbt_xstate;
 
 	gpa_t time;
 	s8  pvclock_tsc_shift;
@@ -1551,6 +1552,7 @@ struct kvm_arch {
 	bool hbt_ud_enabled;
 	bool hbt_retry_enabled;
 	bool hbt_xom_enabled;
+	bool hbt_xstate_storage_enabled;
 
 	/* Deflect RDMSR and WRMSR to user space when they trigger a #GP */
 	u32 user_space_msr_mask;

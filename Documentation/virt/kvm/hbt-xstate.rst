@@ -40,12 +40,19 @@ The harness compiles the actual codec with ASan/UBSan, exercises all 64 request
 masks against all 64 in-use masks in three save formats, checks access failures,
 virtual-layout holes, malformed headers, reserved bytes and MXCSR behavior,
 and compares against native XSAVE64 for all 16 XMM/YMM registers when available.
-Native AVX-512 differential execution is still required on a capable machine.
+An additional differential case loads all 32 ZMM and eight 64-bit opmask
+registers on AVX-512F/BW hosts (BW is needed for KMOVQ). It explicitly skips
+on other hosts. Execution of this case on a capable machine is still needed
+when development takes place on an AVX2-only host.
 
 Remaining integration work
 --------------------------
 
-* Persistent per-vCPU software state and a versioned VMM transfer interface.
+Persistent per-vCPU software storage and a versioned VMM transfer interface
+are implemented by ``KVM_CAP_HBT_X86_XSTATE_STORAGE`` (see ``hbt.rst``). The
+storage API and the codec are separately tested building blocks; an execution
+adapter connecting them to the native FPU is still required.
+
 * Separation of virtual XCR0/CPUID.0D from hardware XCR0/FPU buffer layout.
 * A VMX test mode using CR4 read shadow with actual GUEST_CR4.OSXSAVE=0,
   plus #UD dispatch for the XSAVE family, XGETBV and XSETBV. This also traps

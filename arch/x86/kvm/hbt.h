@@ -5,5 +5,7 @@
 bool kvm_hbt_prepare_ud(struct kvm_vcpu *vcpu);
 long kvm_hbt_ioctl(struct kvm_vcpu *vcpu, unsigned int cmd, void __user *argp);
 void kvm_hbt_reset(struct kvm_vcpu *vcpu);
+long kvm_hbt_xstate_ioctl(struct kvm_vcpu *vcpu, unsigned int cmd, void __user *argp);
+void kvm_hbt_xstate_free(struct kvm_vcpu *vcpu);
 
 #endif

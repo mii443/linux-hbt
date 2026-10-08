@@ -4878,6 +4878,7 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
 		break;
 	case KVM_CAP_HBT_X86_UD:
 	case KVM_CAP_HBT_X86_RETRY:
+	case KVM_CAP_HBT_X86_XSTATE_STORAGE:
 		if (kvm_caps.has_hbt_ud &&
 		    (!kvm || kvm->arch.vm_type == KVM_X86_DEFAULT_VM))
 			r = KVM_HBT_ABI_VERSION;
@@ -6235,6 +6236,10 @@ long kvm_arch_vcpu_ioctl(struct file *filp,
 
 	u.buffer = NULL;
 	switch (ioctl) {
+	case KVM_HBT_GET_XSTATE:
+	case KVM_HBT_SET_XSTATE:
+		r = kvm_hbt_xstate_ioctl(vcpu, ioctl, argp);
+		break;
 	case KVM_HBT_GET_SNAPSHOT:
 	case KVM_HBT_COMPLETE:
 		r = kvm_hbt_ioctl(vcpu, ioctl, argp);
@@ -6928,6 +6933,21 @@ disable_exits_unlock:
 			break;
 		kvm->arch.exit_on_emulation_error = cap->args[0];
 		r = 0;
+		break;
+	case KVM_CAP_HBT_X86_XSTATE_STORAGE:
+		r = -EINVAL;
+		if (!kvm_caps.has_hbt_ud ||
+		    kvm->arch.vm_type != KVM_X86_DEFAULT_VM ||
+		    cap->args[0] != KVM_HBT_XSTATE_VERSION ||
+		    cap->args[1] || cap->args[2] || cap->args[3])
+			break;
+		mutex_lock(&kvm->lock);
+		r = -EBUSY;
+		if (!kvm->created_vcpus) {
+			kvm->arch.hbt_xstate_storage_enabled = true;
+			r = 0;
+		}
+		mutex_unlock(&kvm->lock);
 		break;
 	case KVM_CAP_HBT_X86_XOM:
 		r = -EINVAL;
@@ -13046,6 +13066,7 @@ void kvm_arch_vcpu_destroy(struct kvm_vcpu *vcpu)
 	int idx, cpu;
 
 	kvm_hbt_reset(vcpu);
+	kvm_hbt_xstate_free(vcpu);
 	kvm_clear_async_pf_completion_queue(vcpu);
 	kvm_mmu_unload(vcpu);
 
@@ -13180,6 +13201,9 @@ void kvm_vcpu_reset(struct kvm_vcpu *vcpu, bool init_event)
 	vcpu->arch.apf.halted = false;
 
 	kvm_xstate_reset(vcpu, init_event);
+	/* AVX-512 data and XINUSE survive INIT, like the native FPU components. */
+	if (!init_event)
+		kvm_hbt_xstate_free(vcpu);
 
 	if (!init_event) {
 		vcpu->arch.smbase = 0x30000;

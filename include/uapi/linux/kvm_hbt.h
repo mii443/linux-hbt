@@ -10,6 +10,7 @@
 #define KVM_CAP_HBT_X86_RETRY	0x48425402
 #define KVM_CAP_HBT_X86_XOM	0x48425403
 #define KVM_CAP_HBT_X86_XOM_UPDATE 0x48425404 /* Query only; enabled with XOM. */
+#define KVM_CAP_HBT_X86_XSTATE_STORAGE 0x48425405
 #define KVM_EXIT_HBT_X86_UD	0x48425401
 #define KVM_HBT_ABI_VERSION	1
 #define KVM_HBT_MAX_BYTES	4096
@@ -108,6 +109,24 @@ struct kvm_hbt_xom_update {
 	__u64 replacement_addr;
 };
 
+/* Software-only AVX-512 components. This is not a hardware XSAVE area.
+ * Storage does not advertise or emulate AVX-512 guest instructions.
+ * xfeatures must equal KVM_HBT_XSTATE_FEATURES; xinuse is a subset.
+ * SET canonicalizes components absent from xinuse to zero.
+ */
+#define KVM_HBT_XSTATE_VERSION 1
+#define KVM_HBT_XSTATE_FEATURES ((__u64)0xe0)
+struct kvm_hbt_xstate {
+	__u32 version;
+	__u32 size;
+	__u64 xfeatures;
+	__u64 xinuse;
+	__u64 reserved[5];
+	__u8 opmask[8][8];
+	__u8 zmm_hi[16][32];
+	__u8 hi16_zmm[16][64];
+};
+
 /* Private vCPU ioctls. KVMIO is 0xae; keep this header self-contained. */
 #define KVM_HBT_GET_SNAPSHOT \
 	_IOW(0xae, 0xe8, struct kvm_hbt_snapshot_request)
@@ -121,5 +140,9 @@ struct kvm_hbt_xom_update {
 	_IOWR(0xae, 0xec, struct kvm_hbt_xom_page)
 #define KVM_HBT_UPDATE_XOM \
 	_IOW(0xae, 0xed, struct kvm_hbt_xom_update)
+#define KVM_HBT_GET_XSTATE \
+	_IOR(0xae, 0xee, struct kvm_hbt_xstate)
+#define KVM_HBT_SET_XSTATE \
+	_IOW(0xae, 0xef, struct kvm_hbt_xstate)
 
 #endif /* _UAPI_LINUX_KVM_HBT_H */

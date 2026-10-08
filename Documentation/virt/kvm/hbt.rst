@@ -76,6 +76,51 @@ is available. There is no separate ENABLE_CAP operation; enable XOM as above.
 The original INSTALL ioctl remains available for old callers. Its entries do
 not carry generations and cannot be updated by this interface.
 
+KVM_CAP_HBT_X86_XSTATE_STORAGE
+----------------------------
+
+:Architectures: x86 (VMX, default VM type)
+:Type: VM capability, private number 0x48425405
+:Parameters: args[0] = KVM_HBT_XSTATE_VERSION (1); args[1..3] and flags = 0
+
+An opt-in experimental storage interface for software-managed AVX-512
+components, separate from KVM_GET/SET_XSAVE and their host CPUID layout.
+KVM_CHECK_EXTENSION returns 1 when supported. Enable it before creating any
+vCPU; existing vCPUs cause EBUSY, unsupported arguments cause EINVAL. It does
+not depend on UD/RETRY/XOM or limit the number of vCPUs. It cannot be disabled.
+
+This capability stores data only. It does not advertise AVX-512, change
+guest or hardware XCR0/CR4, execute instructions, or synchronize native FPU
+registers. It is not a promise that a native AVX-512 VM can run or migrate.
+QEMU migration wiring and instruction dispatch are subsequent steps.
+
+KVM_HBT_GET_XSTATE / KVM_HBT_SET_XSTATE
+-------------------------------------
+
+:Type: vCPU ioctls, private numbers 0xee / 0xef
+:Parameters: struct kvm_hbt_xstate (1664 bytes)
+
+GET is output-only; SET is input-only. The structure has a 64-byte header
+(version, size, xfeatures, xinuse and five reserved u64 fields), then 64 bytes
+of opmask, 512 bytes of ZMM0-15 upper halves, and 1024 bytes of ZMM16-31.
+It is neither a guest XSAVE area nor a native FPU image. Its register byte
+arrays use x86 little-endian lane ordering. Set version=1, size=1664,
+xfeatures=0xe0, xinuse to a subset of 0xe0, and reserved fields to zero.
+SET zeroes the backing bytes of components absent from xinuse. GET returns
+this canonical form. No user pointers, FS bases or guest addresses are stored.
+
+Each vCPU starts with zero registers and xinuse=0. Storage survives INIT,
+like native AVX-512 user state; RESET and destruction discard it. A VMM that
+implements a machine reset by writing individual architectural registers
+must explicitly SET an initial software state too. vCPU locking serializes
+GET/SET with execution. SET validates and copies everything before publication;
+allocation, validation or copy failures leave existing state untouched. GET
+copy failures have no state effect and their output must be discarded.
+
+Without opt-in, or for nested/protected guest state, the ioctls return
+EOPNOTSUPP. Invalid fields return EINVAL, user-copy failures EFAULT, and
+allocation failures ENOMEM. They do not require a pending HBT #UD request.
+
 KVM_HBT_GET_XOM_PAGE
 --------------------
 
