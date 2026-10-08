@@ -94,6 +94,29 @@ guest or hardware XCR0/CR4, execute instructions, or synchronize native FPU
 registers. It is not a promise that a native AVX-512 VM can run or migrate.
 QEMU migration wiring and instruction dispatch are subsequent steps.
 
+KVM_CAP_HBT_X86_VIRTUAL_XSTATE
+----------------------------
+
+:Architectures: x86 (VMX, default VM type, native AVX2)
+:Type: VM capability, private number 0x48425406
+:Parameters: args[0] = KVM_HBT_VIRTUAL_XSTATE_VERSION (1); args[1..3] and flags = 0
+
+Experimental virtual CPUID/XCR0 control path. KVM_CHECK_EXTENSION returns 1
+when supported. Enable before creating any vCPU; existing vCPUs cause EBUSY.
+Invalid arguments, unsupported backend and combining with HBT UD/RETRY/XOM
+cause EINVAL. It cannot be disabled and also enables XSTATE_STORAGE.
+
+The VMM installs a validated virtual CPUID.0D profile with user-state mask
+0xe7 via KVM_SET_CPUID2. KVM_GET_SUPPORTED_CPUID remains host-based.
+XGETBV/XSETBV and KVM_GET/SET_XCRS use virtual XCR0; hardware XCR0 and the
+native KVM_GET/SET_XSAVE ABI remain limited to x87/SSE/YMM. VMX forces actual
+CR4.OSXSAVE=0 while preserving its guest-visible read shadow.
+
+Guest vector and XSAVE-family instruction emulation is not implemented by
+this capability. Those instructions continue to fault with #UD, so this
+is not a complete AVX-512 guest CPU or a migration-enablement switch.
+See ``hbt-xstate.rst`` for the required CPUID profile, semantics and tests.
+
 KVM_HBT_GET_XSTATE / KVM_HBT_SET_XSTATE
 -------------------------------------
 

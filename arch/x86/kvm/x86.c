@@ -1216,15 +1216,17 @@ EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_lmsw);
 
 static void kvm_load_xfeatures(struct kvm_vcpu *vcpu, bool load_guest)
 {
+	u64 native_xcr0 = kvm_hbt_native_xfeatures(vcpu, vcpu->arch.xcr0);
+
 	if (vcpu->arch.guest_state_protected)
 		return;
 
 	if (!kvm_is_cr4_bit_set(vcpu, X86_CR4_OSXSAVE))
 		return;
 
-	if (vcpu->arch.xcr0 != kvm_host.xcr0)
+	if (native_xcr0 != kvm_host.xcr0)
 		xsetbv(XCR_XFEATURE_ENABLED_MASK,
-		       load_guest ? vcpu->arch.xcr0 : kvm_host.xcr0);
+		       load_guest ? native_xcr0 : kvm_host.xcr0);
 
 	if (guest_cpu_cap_has(vcpu, X86_FEATURE_XSAVES) &&
 	    vcpu->arch.ia32_xss != kvm_host.xss)
@@ -4883,6 +4885,11 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
 		    (!kvm || kvm->arch.vm_type == KVM_X86_DEFAULT_VM))
 			r = KVM_HBT_ABI_VERSION;
 		break;
+	case KVM_CAP_HBT_X86_VIRTUAL_XSTATE:
+		if (kvm_hbt_virtual_xstate_supported() &&
+		    (!kvm || kvm->arch.vm_type == KVM_X86_DEFAULT_VM))
+			r = KVM_HBT_VIRTUAL_XSTATE_VERSION;
+		break;
 	case KVM_CAP_HBT_X86_XOM:
 	case KVM_CAP_HBT_X86_XOM_UPDATE:
 		if (kvm_caps.has_hbt_xom &&
@@ -5834,8 +5841,8 @@ static int kvm_vcpu_ioctl_x86_get_xsave2(struct kvm_vcpu *vcpu,
 	 * XSAVE/XCRO are not exposed to the guest, and even if XSAVE isn't
 	 * supported by the host.
 	 */
-	u64 supported_xcr0 = vcpu->arch.guest_supported_xcr0 |
-			     XFEATURE_MASK_FPSSE;
+	u64 supported_xcr0 = kvm_hbt_native_xfeatures(vcpu,
+		vcpu->arch.guest_supported_xcr0 | XFEATURE_MASK_FPSSE);
 
 	if (fpstate_is_confidential(&vcpu->arch.guest_fpu))
 		return vcpu->kvm->arch.has_protected_state ? -EINVAL : 0;
@@ -5869,7 +5876,8 @@ static int kvm_vcpu_ioctl_x86_set_xsave(struct kvm_vcpu *vcpu,
 
 	return fpu_copy_uabi_to_guest_fpstate(&vcpu->arch.guest_fpu,
 					      guest_xsave->region,
-					      kvm_caps.supported_xcr0,
+					      kvm_hbt_native_xfeatures(vcpu,
+								 kvm_caps.supported_xcr0),
 					      &vcpu->arch.pkru);
 }
 
@@ -6934,6 +6942,24 @@ disable_exits_unlock:
 		kvm->arch.exit_on_emulation_error = cap->args[0];
 		r = 0;
 		break;
+	case KVM_CAP_HBT_X86_VIRTUAL_XSTATE:
+		r = -EINVAL;
+		if (!kvm_hbt_virtual_xstate_supported() ||
+		    kvm->arch.vm_type != KVM_X86_DEFAULT_VM ||
+		    cap->args[0] != KVM_HBT_VIRTUAL_XSTATE_VERSION ||
+		    cap->args[1] || cap->args[2] || cap->args[3])
+			break;
+		mutex_lock(&kvm->lock);
+		r = -EBUSY;
+		if (kvm->arch.hbt_ud_enabled) {
+			r = -EINVAL;
+		} else if (!kvm->created_vcpus) {
+			kvm->arch.hbt_virtual_xstate_enabled = true;
+			kvm->arch.hbt_xstate_storage_enabled = true;
+			r = 0;
+		}
+		mutex_unlock(&kvm->lock);
+		break;
 	case KVM_CAP_HBT_X86_XSTATE_STORAGE:
 		r = -EINVAL;
 		if (!kvm_caps.has_hbt_ud ||
@@ -6989,7 +7015,9 @@ disable_exits_unlock:
 			break;
 		mutex_lock(&kvm->lock);
 		r = -EBUSY;
-		if (!kvm->created_vcpus) {
+		if (kvm->arch.hbt_virtual_xstate_enabled) {
+			r = -EINVAL;
+		} else if (!kvm->created_vcpus) {
 			kvm->arch.hbt_ud_enabled = true;
 			r = 0;
 		}
@@ -8162,6 +8190,9 @@ int handle_ud(struct kvm_vcpu *vcpu)
 	char sig[5]; /* ud2; .ascii "kvm" */
 	struct x86_exception e;
 	int r;
+
+	if (vcpu->kvm->arch.hbt_virtual_xstate_enabled)
+		emul_type |= EMULTYPE_HBT_XCR;
 
 	r = kvm_check_emulate_insn(vcpu, emul_type, NULL, 0);
 	if (r != X86EMUL_CONTINUE)

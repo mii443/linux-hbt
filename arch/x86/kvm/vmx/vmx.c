@@ -3597,6 +3597,9 @@ void vmx_set_cr4(struct kvm_vcpu *vcpu, unsigned long cr4)
 			hw_cr4 &= ~(X86_CR4_SMEP | X86_CR4_SMAP | X86_CR4_PKE);
 	}
 
+	/* Trap XSAVE-family and AVX instructions while preserving virtual CR4. */
+	if (vcpu->kvm->arch.hbt_virtual_xstate_enabled)
+		hw_cr4 &= ~X86_CR4_OSXSAVE;
 	vmcs_writel(CR4_READ_SHADOW, cr4);
 	vmcs_writel(GUEST_CR4, hw_cr4);
 
@@ -4508,6 +4511,8 @@ void set_cr4_guest_host_mask(struct vcpu_vmx *vmx)
 
 	vcpu->arch.cr4_guest_owned_bits = KVM_POSSIBLE_CR4_GUEST_BITS &
 					  ~vcpu->arch.cr4_guest_rsvd_bits;
+	if (vcpu->kvm->arch.hbt_virtual_xstate_enabled)
+		vcpu->arch.cr4_guest_owned_bits &= ~X86_CR4_OSXSAVE;
 	if (!enable_ept) {
 		vcpu->arch.cr4_guest_owned_bits &= ~X86_CR4_TLBFLUSH_BITS;
 		vcpu->arch.cr4_guest_owned_bits &= ~X86_CR4_PDPTR_BITS;
@@ -5409,6 +5414,9 @@ static int handle_exception_nmi(struct kvm_vcpu *vcpu)
 
 	if (is_invalid_opcode(intr_info)) {
 		int ret;
+
+		if (vcpu->kvm->arch.hbt_virtual_xstate_enabled)
+			return handle_ud(vcpu);
 
 		if (vcpu->kvm->arch.hbt_ud_enabled) {
 			if (!(vect_info & VECTORING_INFO_VALID_MASK) &&

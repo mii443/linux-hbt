@@ -3798,6 +3798,20 @@ out:
 	return rc;
 }
 
+static int em_xgetbv(struct x86_emulate_ctxt *ctxt)
+{
+	u64 value;
+	u32 index = reg_read(ctxt, VCPU_REGS_RCX);
+
+	if (!(ctxt->ops->get_cr(ctxt, 4) & X86_CR4_OSXSAVE))
+		return emulate_ud(ctxt);
+	if (ctxt->ops->get_xcr(ctxt, index, &value))
+		return emulate_gp(ctxt, 0);
+	*reg_write(ctxt, VCPU_REGS_RAX) = (u32)value;
+	*reg_write(ctxt, VCPU_REGS_RDX) = (u32)(value >> 32);
+	return X86EMUL_CONTINUE;
+}
+
 static int em_xsetbv(struct x86_emulate_ctxt *ctxt)
 {
 	u32 eax, ecx, edx;
@@ -3990,7 +4004,7 @@ static const struct opcode group7_rm1[] = {
 };
 
 static const struct opcode group7_rm2[] = {
-	N,
+	I(ImplicitOps,				em_xgetbv),
 	II(ImplicitOps | Priv,			em_xsetbv,	xsetbv),
 	N, N, N, N, N, N,
 };
@@ -5124,7 +5138,9 @@ done_modrm:
 	}
 
 	if (unlikely(emulation_type & EMULTYPE_TRAP_UD) &&
-	    likely(!(ctxt->d & EmulateOnUD)))
+	    likely(!(ctxt->d & EmulateOnUD)) &&
+	    !((emulation_type & EMULTYPE_HBT_XCR) &&
+	      (ctxt->execute == em_xgetbv || ctxt->execute == em_xsetbv)))
 		return EMULATION_FAILED;
 
 	if (unlikely(ctxt->d &
@@ -5283,6 +5299,13 @@ int x86_emulate_insn(struct x86_emulate_ctxt *ctxt, bool check_intercepts)
 
 	/* LOCK prefix is allowed only with some instructions */
 	if (ctxt->lock_prefix && (!(ctxt->d & Lock) || ctxt->dst.type != OP_MEM)) {
+		rc = emulate_ud(ctxt);
+		goto done;
+	}
+
+	/* OSXSAVE=0 raises #UD before XSETBV's CPL check can raise #GP. */
+	if ((ctxt->execute == em_xgetbv || ctxt->execute == em_xsetbv) &&
+	    !(ops->get_cr(ctxt, 4) & X86_CR4_OSXSAVE)) {
 		rc = emulate_ud(ctxt);
 		goto done;
 	}

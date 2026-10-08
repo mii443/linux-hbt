@@ -887,6 +887,7 @@ struct kvm_vcpu_arch {
 	 */
 	struct fpu_guest guest_fpu;
 
+	/* Guest-visible XCR0; HBT masks this before loading hardware. */
 	u64 xcr0;
 	u64 guest_supported_xcr0;
 	u64 ia32_xss;
@@ -1553,6 +1554,7 @@ struct kvm_arch {
 	bool hbt_retry_enabled;
 	bool hbt_xom_enabled;
 	bool hbt_xstate_storage_enabled;
+	bool hbt_virtual_xstate_enabled;
 
 	/* Deflect RDMSR and WRMSR to user space when they trigger a #GP */
 	u32 user_space_msr_mask;
@@ -2218,6 +2220,8 @@ u64 vcpu_tsc_khz(struct kvm_vcpu *vcpu);
 #define EMULTYPE_COMPLETE_USER_EXIT (1 << 7)
 #define EMULTYPE_WRITE_PF_TO_SP	    (1 << 8)
 #define EMULTYPE_SKIP_SOFT_INT	    (1 << 9)
+/* With TRAP_UD, also permit XGETBV/XSETBV for the opt-in HBT control path. */
+#define EMULTYPE_HBT_XCR		    (1 << 10)
 
 #define EMULTYPE_SET_SOFT_INT_VECTOR(v)	((u32)((v) & 0xff) << 16)
 #define EMULTYPE_GET_SOFT_INT_VECTOR(e)	(((e) >> 16) & 0xff)

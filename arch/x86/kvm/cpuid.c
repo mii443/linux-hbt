@@ -23,6 +23,7 @@
 #include <asm/sgx.h>
 #include <asm/cpuid/api.h>
 #include "cpuid.h"
+#include "hbt.h"
 #include "lapic.h"
 #include "mmu.h"
 #include "trace.h"
@@ -263,7 +264,9 @@ static u64 cpuid_get_supported_xcr0(struct kvm_vcpu *vcpu)
 	if (!best)
 		return 0;
 
-	return (best->eax | ((u64)best->edx << 32)) & kvm_caps.supported_xcr0;
+	return (best->eax | ((u64)best->edx << 32)) &
+		(vcpu->kvm->arch.hbt_virtual_xstate_enabled ? 0xe7 :
+		 kvm_caps.supported_xcr0);
 }
 
 static u64 cpuid_get_supported_xss(struct kvm_vcpu *vcpu)
@@ -314,7 +317,9 @@ static void kvm_update_cpuid_runtime(struct kvm_vcpu *vcpu)
 
 	best = kvm_find_cpuid_entry_index(vcpu, 0xD, 0);
 	if (best)
-		best->ebx = xstate_required_size(vcpu->arch.xcr0, false);
+		best->ebx = vcpu->kvm->arch.hbt_virtual_xstate_enabled ?
+			kvm_hbt_xstate_size(vcpu, vcpu->arch.xcr0) :
+			xstate_required_size(vcpu->arch.xcr0, false);
 
 	best = kvm_find_cpuid_entry_index(vcpu, 0xD, 1);
 	if (best && (cpuid_entry_has(best, X86_FEATURE_XSAVES) ||
@@ -440,6 +445,8 @@ void kvm_vcpu_after_set_cpuid(struct kvm_vcpu *vcpu)
 
 	vcpu->arch.guest_supported_xcr0 = cpuid_get_supported_xcr0(vcpu);
 	vcpu->arch.guest_supported_xss = cpuid_get_supported_xss(vcpu);
+	if (vcpu->kvm->arch.hbt_virtual_xstate_enabled)
+		guest_cpu_cap_set(vcpu, X86_FEATURE_AVX512F);
 
 	vcpu->arch.pv_cpuid.features = kvm_apply_cpuid_pv_features_quirk(vcpu);
 
@@ -565,6 +572,9 @@ static int kvm_set_cpuid(struct kvm_vcpu *vcpu, struct kvm_cpuid_entry2 *e2,
 	}
 #endif
 
+	r = kvm_hbt_check_cpuid(vcpu);
+	if (r)
+		goto err;
 	r = kvm_check_cpuid(vcpu);
 	if (r)
 		goto err;
