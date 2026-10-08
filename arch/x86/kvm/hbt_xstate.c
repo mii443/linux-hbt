@@ -8,6 +8,9 @@
 
 static const u32 component_size[8] = { 0, 0, 256, 0, 0, 64, 512, 1024 };
 
+/* AMD MXCSR.MM is bit 17. Only the virtual CPU's mask may enable it. */
+#define HBT_MXCSR_KNOWN_MASK 0x0002ffffU
+
 static void *component(struct hbt_xstate *state, unsigned int i)
 {
 	switch (i) {
@@ -46,7 +49,7 @@ int hbt_xstate_layout_valid(const struct hbt_xstate_layout *layout)
 
 	if (!valid_mask(layout->supported) ||
 	    layout->align64 & ~((u32)layout->supported & ~3U) ||
-	    (layout->mxcsr_mask & ~0xffffU) ||
+	    (layout->mxcsr_mask & ~HBT_MXCSR_KNOWN_MASK) ||
 	    (layout->mxcsr_mask & 0x1f80) != 0x1f80)
 		return -EINVAL;
 	for (i = 0; i < 8; i++) {

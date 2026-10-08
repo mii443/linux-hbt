@@ -30,7 +30,7 @@ struct hbt_xstate_layout {
 	u64 supported;
 	u32 offset[8]; /* Standard offsets for components 2, 5, 6, 7. */
 	u32 align64;   /* CPUID.0D.i:ECX[1], indexed by component. */
-	u32 mxcsr_mask;
+	u32 mxcsr_mask; /* Virtual CPU policy, including optional AMD MM (bit 17). */
 	bool compacted;
 };
 

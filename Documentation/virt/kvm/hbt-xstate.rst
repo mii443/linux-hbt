@@ -13,6 +13,13 @@ XCOMP_BV and the supplied component alignment flags. Only user components
 0, 1, 2, 5, 6 and 7 are supported. Other features, supervisor state, and
 non-REX.W legacy representations require subsequent implementation.
 
+The MXCSR mask can include AMD's misaligned-exception mask (MM, bit 17);
+bit 16 and bits 31:18 remain reserved. MM is accepted in state only when
+the virtual CPU's mask enables it. An Intel profile therefore still rejects
+MM. This codec permission does not imply that a host CPU can load MM or
+execute the corresponding SSE behavior: the future execution adapter must
+also honor the virtual CPU profile. See AMD APM Volume 1, section 4.2.2.
+
 Save supports XSAVE, XSAVEOPT without the optional modified-state optimization,
 and XSAVEC. It preserves unrequested standard-header bits and software-owned
 legacy bytes. XSAVEOPT honors the init optimization; XSAVEC also handles the
