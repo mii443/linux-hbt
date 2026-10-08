@@ -1165,7 +1165,7 @@ static int decode_modrm(struct x86_emulate_ctxt *ctxt,
 				modrm_ea += insn_fetch(u16, ctxt);
 			break;
 		case 1:
-			modrm_ea += insn_fetch(s8, ctxt);
+			modrm_ea += insn_fetch(s8, ctxt) * ctxt->disp8_scale;
 			break;
 		case 2:
 			modrm_ea += insn_fetch(u16, ctxt);
@@ -1233,7 +1233,7 @@ static int decode_modrm(struct x86_emulate_ctxt *ctxt,
 		}
 		switch (ctxt->modrm_mod) {
 		case 1:
-			modrm_ea += insn_fetch(s8, ctxt);
+			modrm_ea += insn_fetch(s8, ctxt) * ctxt->disp8_scale;
 			break;
 		case 2:
 			modrm_ea += insn_fetch(s32, ctxt);
@@ -3855,6 +3855,96 @@ static int hbt_xstate_write(void *opaque, u32 offset, const void *data, u32 size
 	return hbt_xstate_access(opaque, offset, (void *)data, size, true);
 }
 
+enum hbt_vector_op {
+	HBT_VECTOR_XOR = 1, HBT_VECTOR_ADD, HBT_VECTOR_BROADCAST,
+	HBT_VECTOR_LOAD, HBT_VECTOR_STORE,
+};
+
+static int em_hbt_vector(struct x86_emulate_ctxt *ctxt)
+{
+	u32 left[16] __aligned(32), right[16] __aligned(32), result[16] __aligned(32);
+	struct hbt_xstate_access access = {
+		.ctxt = ctxt, .rc = X86EMUL_CONTINUE,
+	};
+	unsigned int op = ctxt->hbt_vector.op, bytes = ctxt->hbt_vector.bytes;
+	unsigned int reg = ctxt->modrm_reg | ctxt->hbt_vector.reg_hi;
+	unsigned int rm = ctxt->modrm_rm | ctxt->hbt_vector.rm_hi;
+	unsigned int src1 = ctxt->hbt_vector.src1, i;
+	bool memory = ctxt->modrm_mod != 3, store = op == HBT_VECTOR_STORE;
+	u32 eax = 1, ebx, ecx = 0, edx;
+	u64 xcr0, mask = (1U << (bytes / 4)) - 1;
+	unsigned long cr0 = ctxt->ops->get_cr(ctxt, 0);
+
+	if ((ctxt->mode != X86EMUL_MODE_PROT32 && ctxt->mode != X86EMUL_MODE_PROT64) ||
+	    (ctxt->mode != X86EMUL_MODE_PROT64 &&
+	     (reg >= 8 || src1 >= 8 || (!memory && rm >= 8))) ||
+	    (ctxt->hbt_vector.zero && (!ctxt->hbt_vector.mask || (store && memory))) ||
+	    (ctxt->hbt_vector.broadcast &&
+	     (!memory || (op != HBT_VECTOR_XOR && op != HBT_VECTOR_ADD))) ||
+	    !(ctxt->ops->get_cr(ctxt, 4) & X86_CR4_OSXSAVE) || (cr0 & X86_CR0_EM))
+		return emulate_ud(ctxt);
+	ctxt->ops->get_cpuid(ctxt, &eax, &ebx, &ecx, &edx, true);
+	if (!(ecx & BIT(28)) || ctxt->ops->get_xcr(ctxt, 0, &xcr0) ||
+	    (xcr0 & 6) != 6 || (ctxt->hbt_vector.evex && (xcr0 & 0xe6) != 0xe6))
+		return emulate_ud(ctxt);
+	eax = 7; ecx = 0;
+	ctxt->ops->get_cpuid(ctxt, &eax, &ebx, &ecx, &edx, true);
+	if ((ctxt->hbt_vector.evex &&
+	     (!(ebx & BIT(16)) || (bytes < 64 && !(ebx & BIT(31))))) ||
+	    (!ctxt->hbt_vector.evex &&
+	     (op == HBT_VECTOR_BROADCAST || (bytes == 32 && op <= HBT_VECTOR_ADD)) &&
+	     !(ebx & BIT(5))))
+		return emulate_ud(ctxt);
+	if (cr0 & X86_CR0_TS)
+		return emulate_nm(ctxt);
+	if (ctxt->hbt_vector.mask)
+		mask &= ctxt->ops->hbt_opmask_read(ctxt, ctxt->hbt_vector.mask);
+	if (store && !memory) {
+		unsigned int tmp = reg;
+		reg = rm; rm = tmp;
+	}
+	memset(left, 0, sizeof(left));
+	memset(right, 0, sizeof(right));
+	memset(result, 0, sizeof(result));
+	if (store && memory) {
+		if (ctxt->ops->hbt_vector_read(ctxt, reg, right))
+			return X86EMUL_UNHANDLEABLE;
+		access.saving = true;
+		for (i = 0; i < bytes / 4; i++)
+			if ((mask & BIT(i)) && hbt_xstate_write(&access, i * 4, &right[i], 4))
+				return access.rc;
+		return X86EMUL_CONTINUE;
+	}
+	if (op <= HBT_VECTOR_ADD && ctxt->ops->hbt_vector_read(ctxt, src1, left))
+		return X86EMUL_UNHANDLEABLE;
+	if (!memory) {
+		if (ctxt->ops->hbt_vector_read(ctxt, rm, right))
+			return X86EMUL_UNHANDLEABLE;
+	} else if (op == HBT_VECTOR_BROADCAST || ctxt->hbt_vector.broadcast) {
+		if (mask && hbt_xstate_read(&access, 0, right, 4))
+			return access.rc;
+	} else {
+		/* Masked-off lanes do not access guest memory or raise faults. */
+		for (i = 0; i < bytes / 4; i++)
+			if ((mask & BIT(i)) && hbt_xstate_read(&access, i * 4, &right[i], 4))
+				return access.rc;
+	}
+	if (!ctxt->hbt_vector.zero && ctxt->ops->hbt_vector_read(ctxt, reg, result))
+		return X86EMUL_UNHANDLEABLE;
+	for (i = 0; i < bytes / 4; i++) {
+		u32 value = right[(op == HBT_VECTOR_BROADCAST || ctxt->hbt_vector.broadcast) ? 0 : i];
+
+		if (!(mask & BIT(i)))
+			continue;
+		result[i] = op == HBT_VECTOR_ADD ? left[i] + value :
+			    op == HBT_VECTOR_XOR ? left[i] ^ value : value;
+	}
+	/* VEX and EVEX writes clear all bits above the selected vector length. */
+	memset((u8 *)result + bytes, 0, 64 - bytes);
+	return ctxt->ops->hbt_vector_write(ctxt, reg, result) ?
+		X86EMUL_UNHANDLEABLE : X86EMUL_CONTINUE;
+}
+
 static int em_hbt_xstate(struct x86_emulate_ctxt *ctxt, enum hbt_xstate_format op)
 {
 	struct hbt_xstate_access access = {
@@ -4916,6 +5006,67 @@ done:
 	return rc;
 }
 
+static int x86_decode_hbt_vector(struct x86_emulate_ctxt *ctxt, u8 first,
+				u8 p0, struct opcode *opcode)
+{
+	u8 p1, p2 = 0, map, pp, length, v;
+	int rc = X86EMUL_CONTINUE;
+
+	*opcode = ud;
+	if (ctxt->rep_prefix || ctxt->op_prefix || ctxt->rex_prefix)
+		return rc;
+	ctxt->hbt_vector.evex = first == 0x62;
+	if (first == 0xc5) {
+		p1 = p0 & 0x7f;
+		p0 = (p0 & 0x80) | 0x61;
+	} else {
+		p1 = insn_fetch(u8, ctxt);
+	}
+	v = (~p1 >> 3) & 15;
+	pp = p1 & 3;
+	if (first == 0x62) {
+		p2 = insn_fetch(u8, ctxt);
+		if ((p0 & 0x0c) || !(p1 & 4) || (p1 & 0x80))
+			return rc;
+		map = p0 & 3;
+		length = (p2 >> 5) & 3;
+		if (length == 3)
+			return rc;
+		v |= (~p2 & 8) << 1;
+		ctxt->hbt_vector.reg_hi = (~p0 & 0x10);
+		ctxt->hbt_vector.rm_hi = (~p0 & 0x40) >> 2;
+		ctxt->hbt_vector.mask = p2 & 7;
+		ctxt->hbt_vector.zero = p2 & 0x80;
+		ctxt->hbt_vector.broadcast = p2 & 0x10;
+	} else {
+		map = p0 & 31;
+		length = (p1 >> 2) & 1;
+	}
+	ctxt->hbt_vector.bytes = 16 << length;
+	ctxt->hbt_vector.src1 = v;
+	ctxt->rex_prefix = REX_PREFIX;
+	ctxt->rex_bits = (~p0 >> 5) & 7;
+	ctxt->b = insn_fetch(u8, ctxt);
+	if (map == 1 && pp == 1 && (ctxt->b == 0xef || ctxt->b == 0xfe))
+		ctxt->hbt_vector.op = ctxt->b == 0xef ? HBT_VECTOR_XOR : HBT_VECTOR_ADD;
+	else if (map == 2 && pp == 1 && ctxt->b == 0x58 && !v)
+		ctxt->hbt_vector.op = HBT_VECTOR_BROADCAST;
+	else if (map == 1 && pp == 2 && (ctxt->b == 0x6f || ctxt->b == 0x7f) && !v)
+		ctxt->hbt_vector.op = ctxt->b == 0x6f ? HBT_VECTOR_LOAD : HBT_VECTOR_STORE;
+	else
+		return rc;
+	ctxt->opcode_len = map + 1;
+	if (first == 0x62)
+		ctxt->disp8_scale = ctxt->hbt_vector.broadcast ||
+			ctxt->hbt_vector.op == HBT_VECTOR_BROADCAST ? 4 : ctxt->hbt_vector.bytes;
+	*opcode = (struct opcode) {
+		.flags = ImplicitOps | ModRM | Unaligned,
+		.u.execute = em_hbt_vector,
+	};
+done:
+	return rc;
+}
+
 static int x86_decode_avx(struct x86_emulate_ctxt *ctxt,
 			  u8 vex_1st, u8 vex_2nd, struct opcode *opcode)
 {
@@ -5113,7 +5264,19 @@ done_prefixes:
 		ctxt->op_bytes = 8;
 
 	/* Opcode byte(s). */
-	if (ctxt->b == 0xc4 || ctxt->b == 0xc5) {
+	if ((emulation_type & EMULTYPE_HBT_XSTATE) &&
+	    (ctxt->b == 0x62 || ctxt->b == 0xc4 || ctxt->b == 0xc5)) {
+		u8 p0 = insn_fetch(u8, ctxt);
+
+		if (mode != X86EMUL_MODE_PROT64 && (p0 & 0xc0) != 0xc0) {
+			opcode = opcode_table[ctxt->b];
+			ctxt->modrm = p0;
+			goto done_modrm;
+		}
+		rc = x86_decode_hbt_vector(ctxt, ctxt->b, p0, &opcode);
+		if (rc != X86EMUL_CONTINUE)
+			goto done;
+	} else if (ctxt->b == 0xc4 || ctxt->b == 0xc5) {
 		/* VEX or LDS/LES */
 		u8 vex_2nd = insn_fetch(u8, ctxt);
 		if (mode != X86EMUL_MODE_PROT64 && (vex_2nd & 0xc0) != 0xc0) {
@@ -5268,7 +5431,8 @@ done_modrm:
 	    !((emulation_type & EMULTYPE_HBT_XSTATE) &&
 	      (ctxt->execute == em_xgetbv || ctxt->execute == em_xsetbv ||
 	       ctxt->execute == em_xsave || ctxt->execute == em_xsaveopt ||
-	       ctxt->execute == em_xsavec || ctxt->execute == em_xrstor)))
+	       ctxt->execute == em_xsavec || ctxt->execute == em_xrstor ||
+	       ctxt->execute == em_hbt_vector)))
 		return EMULATION_FAILED;
 
 	if (unlikely(ctxt->d &
@@ -5345,9 +5509,11 @@ done_modrm:
 	/* Decode and fetch the destination operand: register or memory. */
 	rc = decode_operand(ctxt, &ctxt->dst, (ctxt->d >> DstShift) & OpMask);
 
-	if (ctxt->rip_relative && likely(ctxt->memopp))
-		ctxt->memopp->addr.mem.ea = address_mask(ctxt,
-					ctxt->memopp->addr.mem.ea + ctxt->_eip);
+	if (ctxt->rip_relative) {
+		struct operand *mem = ctxt->memopp ?: &ctxt->memop;
+
+		mem->addr.mem.ea = address_mask(ctxt, mem->addr.mem.ea + ctxt->_eip);
+	}
 
 done:
 	if (rc == X86EMUL_PROPAGATE_FAULT)
@@ -5404,6 +5570,8 @@ void init_decode_cache(struct x86_emulate_ctxt *ctxt)
 {
 	/* Clear fields that are set conditionally but read without a guard. */
 	ctxt->rip_relative = false;
+	ctxt->disp8_scale = 1;
+	memset(&ctxt->hbt_vector, 0, sizeof(ctxt->hbt_vector));
 	ctxt->rex_prefix = REX_NONE;
 	ctxt->rex_bits = 0;
 	ctxt->lock_prefix = 0;

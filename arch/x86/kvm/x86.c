@@ -4885,6 +4885,11 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
 		    (!kvm || kvm->arch.vm_type == KVM_X86_DEFAULT_VM))
 			r = KVM_HBT_ABI_VERSION;
 		break;
+	case KVM_CAP_HBT_X86_INTEGER_VECTOR:
+		if (kvm_hbt_virtual_xstate_supported() &&
+		    (!kvm || kvm->arch.vm_type == KVM_X86_DEFAULT_VM))
+			r = KVM_HBT_INTEGER_VECTOR_VERSION;
+		break;
 	case KVM_CAP_HBT_X86_VIRTUAL_XSTATE:
 		if (kvm_hbt_virtual_xstate_supported() &&
 		    (!kvm || kvm->arch.vm_type == KVM_X86_DEFAULT_VM))
@@ -9062,6 +9067,23 @@ static int emulator_hbt_xstate(struct x86_emulate_ctxt *ctxt, enum hbt_xstate_fo
 	return kvm_hbt_emulate_xstate(emul_to_vcpu(ctxt), op, requested, mode64, rex_w, io);
 }
 
+static int emulator_hbt_vector_read(struct x86_emulate_ctxt *ctxt, unsigned int reg,
+				    u32 data[16])
+{
+	return kvm_hbt_vector_read(emul_to_vcpu(ctxt), reg, data);
+}
+
+static int emulator_hbt_vector_write(struct x86_emulate_ctxt *ctxt, unsigned int reg,
+				     const u32 data[16])
+{
+	return kvm_hbt_vector_write(emul_to_vcpu(ctxt), reg, data);
+}
+
+static u64 emulator_hbt_opmask_read(struct x86_emulate_ctxt *ctxt, unsigned int reg)
+{
+	return kvm_hbt_opmask_read(emul_to_vcpu(ctxt), reg);
+}
+
 static void emulator_vm_bugged(struct x86_emulate_ctxt *ctxt)
 {
 	struct kvm *kvm = emul_to_vcpu(ctxt)->kvm;
@@ -9138,6 +9160,9 @@ static const struct x86_emulate_ops emulate_ops = {
 	.get_xcr             = emulator_get_xcr,
 	.set_xcr             = emulator_set_xcr,
 	.hbt_xstate          = emulator_hbt_xstate,
+	.hbt_vector_read     = emulator_hbt_vector_read,
+	.hbt_vector_write    = emulator_hbt_vector_write,
+	.hbt_opmask_read     = emulator_hbt_opmask_read,
 	.get_untagged_addr   = emulator_get_untagged_addr,
 	.is_canonical_addr   = emulator_is_canonical_addr,
 	.page_address_valid  = emulator_page_address_valid,

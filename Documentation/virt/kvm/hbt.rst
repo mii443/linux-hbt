@@ -92,7 +92,8 @@ not depend on UD/RETRY/XOM or limit the number of vCPUs. It cannot be disabled.
 This capability stores data only. It does not advertise AVX-512, change
 guest or hardware XCR0/CR4, execute instructions, or synchronize native FPU
 registers. It is not a promise that a native AVX-512 VM can run or migrate.
-QEMU migration wiring and instruction dispatch are subsequent steps.
+The virtual-XSTATE execution mode below connects storage to guest execution
+and VMM state transfer; storage alone does not enable that mode.
 
 KVM_CAP_HBT_X86_VIRTUAL_XSTATE
 ----------------------------
@@ -113,9 +114,22 @@ native KVM_GET/SET_XSAVE ABI remain limited to x87/SSE/YMM. VMX forces actual
 CR4.OSXSAVE=0 while preserving its guest-visible read shadow.
 
 Guest XSAVE/XRSTOR, XSAVEOPT and XSAVEC are emulated with native FPU and
-software AVX-512 state synchronization. Vector instructions continue to
-fault with #UD; this is not a complete AVX-512 guest CPU or a migration switch.
+software AVX-512 state synchronization. A bounded integer VEX/EVEX executor is
+available when INTEGER_VECTOR reports version 1. This is not a complete
+AVX-512 guest CPU.
 See ``hbt-xstate.rst`` for the required CPUID profile, semantics and tests.
+
+KVM_CAP_HBT_X86_INTEGER_VECTOR
+------------------------------
+
+:Architectures: x86 (VMX, default VM type, native AVX2)
+:Type: Query-only capability, private number 0x48425407
+
+KVM_CHECK_EXTENSION returns KVM_HBT_INTEGER_VECTOR_VERSION (1) when the bounded
+integer executor described in ``hbt-xstate.rst`` is available. Enable
+VIRTUAL_XSTATE to use it; there is no separate ENABLE_CAP operation. This check
+lets VMMs reject older storage/control-only kernels before starting a guest.
+It does not promise the complete AVX2, AVX512F or AVX512VL instruction sets.
 
 KVM_HBT_GET_XSTATE / KVM_HBT_SET_XSTATE
 -------------------------------------

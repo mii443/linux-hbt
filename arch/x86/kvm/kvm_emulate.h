@@ -246,6 +246,9 @@ struct x86_emulate_ops {
 	void (*triple_fault)(struct x86_emulate_ctxt *ctxt);
 	int (*get_xcr)(struct x86_emulate_ctxt *ctxt, u32 index, u64 *xcr);
 	int (*set_xcr)(struct x86_emulate_ctxt *ctxt, u32 index, u64 xcr);
+	int (*hbt_vector_read)(struct x86_emulate_ctxt *ctxt, unsigned int reg, u32 data[16]);
+	int (*hbt_vector_write)(struct x86_emulate_ctxt *ctxt, unsigned int reg, const u32 data[16]);
+	u64 (*hbt_opmask_read)(struct x86_emulate_ctxt *ctxt, unsigned int reg);
 	int (*hbt_xstate)(struct x86_emulate_ctxt *ctxt, enum hbt_xstate_format op,
 			  u64 requested, bool mode64, bool rex_w,
 			  const struct hbt_xstate_io *io);
@@ -379,6 +382,12 @@ struct x86_emulate_ctxt {
 	};
 	int (*check_perm)(struct x86_emulate_ctxt *ctxt);
 
+	/* Opt-in software vector decoding; never used by ordinary KVM guests. */
+	struct {
+		u8 op, bytes, src1, reg_hi, rm_hi, mask;
+		bool evex, zero, broadcast;
+	} hbt_vector;
+	u8 disp8_scale;
 	bool rip_relative;
 	enum rex_type rex_prefix;
 	u8 rex_bits;

@@ -17,6 +17,10 @@ int kvm_hbt_emulate_xstate(struct kvm_vcpu *vcpu, enum hbt_xstate_format op,
 			 u64 requested, bool mode64, bool rex_w,
 			 const struct hbt_xstate_io *io);
 
+int kvm_hbt_vector_read(struct kvm_vcpu *vcpu, unsigned int reg, u32 data[16]);
+int kvm_hbt_vector_write(struct kvm_vcpu *vcpu, unsigned int reg, const u32 data[16]);
+u64 kvm_hbt_opmask_read(struct kvm_vcpu *vcpu, unsigned int reg);
+
 /* Native KVM XSAVE/FPU buffers always retain the host's layout. */
 static inline u64 kvm_hbt_native_xfeatures(struct kvm_vcpu *vcpu, u64 mask)
 {

@@ -12,6 +12,8 @@
 #define KVM_CAP_HBT_X86_XOM_UPDATE 0x48425404 /* Query only; enabled with XOM. */
 #define KVM_CAP_HBT_X86_XSTATE_STORAGE 0x48425405
 #define KVM_CAP_HBT_X86_VIRTUAL_XSTATE 0x48425406
+/* Query-only: bounded integer execution in virtual-XSTATE mode, not full ISA. */
+#define KVM_CAP_HBT_X86_INTEGER_VECTOR 0x48425407
 #define KVM_EXIT_HBT_X86_UD	0x48425401
 #define KVM_HBT_ABI_VERSION	1
 #define KVM_HBT_MAX_BYTES	4096
@@ -117,6 +119,7 @@ struct kvm_hbt_xom_update {
  */
 #define KVM_HBT_XSTATE_VERSION 1
 #define KVM_HBT_VIRTUAL_XSTATE_VERSION 1
+#define KVM_HBT_INTEGER_VECTOR_VERSION 1
 #define KVM_HBT_XSTATE_FEATURES ((__u64)0xe0)
 struct kvm_hbt_xstate {
 	__u32 version;

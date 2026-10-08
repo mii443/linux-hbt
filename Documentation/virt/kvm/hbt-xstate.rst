@@ -5,8 +5,9 @@ The implementation has a host-independent XSAVE/XRSTOR codec in
 ``arch/x86/kvm/hbt_xstate.[ch]``, software AVX-512 register storage, and an
 opt-in VMX path for virtual CPUID/XCR0 and guest XSAVE-family emulation.
 ``hbt_xstate_emulate.c`` connects the live native FPU to the codec and software
-state. Vector execution and QEMU integration are still needed to make an
-AVX-512 VM executable or migratable to an AVX2 host.
+state. A bounded integer VEX/EVEX executor and the parent repository's QEMU
+integration now support native AVX-512 -> AVX2/HBT live migration of the
+validation guest, including re-export after software execution.
 
 The normalized state holds x87/SSE, YMM_Hi128, opmask, ZMM_Hi256 and Hi16_ZMM.
 The caller supplies the virtual CPUID.0D layout and MXCSR mask. Standard
@@ -118,7 +119,7 @@ CPUID feature and OSXSAVE before CR0.TS (#NM), and ignore CR0.EM. Invalid
 headers/MXCSR and misalignment raise #GP(0); alignment checking also uses
 the architecturally permitted #GP choice at CPL3. Illegal LOCK prefixes and
 unadvertised optional instructions raise #UD. Prefix encodings for PTWRITE
-and CLWB are not mistaken for XSAVE/XSAVEOPT. AVX/AVX-512 vector instructions,
+and CLWB are not mistaken for XSAVE/XSAVEOPT. Unsupported vector instructions,
 XSAVES and XRSTORS still raise #UD. This remains an experimental CPU model.
 
 ``kernel-work/tests/hbt-cpuid-live.c`` in the parent repository executes on
@@ -126,7 +127,7 @@ the actual KVM backend inside the disposable nested test VM. For each of
 the Intel/AMD layouts it tests all 256 low-byte XCR0 values, malformed
 profiles and unchanged state on rejection, CPL0/3, 32/64-bit execution,
 CR4 read/write shadowing, dynamic CPUID, per-vCPU isolation, native XSAVE
-boundaries, and continued trapping of vector instructions.
+boundaries, and continued trapping of unsupported vector instructions.
 
 ``hbt-xsave-live.c`` executes 768 mask/format round-trips across Intel/AMD
 layouts and 32/64-bit modes. It also checks actual SSE updates before save,
@@ -137,16 +138,49 @@ uncommitted state on failed restore, partial save writes, vCPU isolation and
 dirty logging. Protected 16-bit, real mode and VM86 execution have not been
 validated by this live harness.
 
-Remaining integration work
---------------------------
+Integer vector execution and migration
+--------------------------------------
 
-Persistent per-vCPU software storage and a versioned VMM transfer interface
-are implemented by ``KVM_CAP_HBT_X86_XSTATE_STORAGE`` (see ``hbt.rst``). The
-storage API, codec and guest execution adapter are connected and tested.
+Query-only KVM_CAP_HBT_X86_INTEGER_VECTOR returns version 1 for the bounded
+integer executor. A VMM should require it as well as VIRTUAL_XSTATE to avoid
+starting a vector guest on earlier control/storage-only kernels.
 
-* AVX/AVX-512 execution with correct mixed native/software state changes.
-* XSAVES/XRSTORS and supervisor-state support if the target CPU profile needs them.
-* QEMU import/export, guest context-switch and signal tests, then migration.
+The opt-in decoder accepts VPXOR/VPXORD, VPADDD, VPBROADCASTD and
+VMOVDQU/VMOVDQU32 in 32/64-bit protected mode. VEX lengths are 128/256 bits;
+EVEX lengths are 128/256/512, with AVX512VL required for the shorter EVEX forms.
+It validates virtual CPUID, CR0/CR4 and XCR0, supports high registers, opmasks,
+merge/zero behavior, broadcast, compressed disp8 and RIP-relative addressing.
+Invalid prefixes, unavailable state/features and unsupported encodings trap.
+Virtual state availability is checked before CR0.TS (#NM).
+
+Low YMM halves use the live native FPU under fpregs_lock; upper halves and
+high registers use the per-vCPU software state. Scalar integer operations
+produce the result. Register destinations commit after all required guest RAM
+reads succeed, and allocation precedes native register writes. Masked-off
+memory lanes are not accessed. Store writes participate in dirty accounting;
+completed lanes can remain visible on a later fault. MMIO is unsupported.
+The vCPU lock serializes execution with GET/SET state transfer. VEX/EVEX writes
+zero bits above their vector length and conservatively mark changed software
+components in use; other registers/components are preserved.
+
+The parent repository's QEMU opt-in mode exposes an AMD- or Intel-offset
+profile and transfers software state through the existing AVX-512 CPU VMState
+subsection. Native XSAVE ioctls receive only components 0..2, while the software
+API transfers components 5..7. KVM_GET/SET_XCRS carries the virtual XCR0. Native
+source execution, migration without reboot, guest XSAVE of all 32 ZMMs/eight
+opmasks, continuing arithmetic and RAM checks, and HBT-to-HBT re-export are
+covered by ``test-hbt-avx512-migration.py``. See the parent repository's
+``kernel-work/LIVE-MIGRATION.md`` for configuration and limitations.
+
+``hbt-vector-live.c`` runs 480 register/mask/length cases in 32/64-bit modes,
+plus narrow VEX zeroing, memory broadcast, masked stores, compressed and
+RIP-relative addressing, fault suppression, failed-load state preservation,
+and XCR0/CR0/CR4 guards on the actual KVM backend.
+
+Remaining work includes broader AVX/AVX-512 coverage (floating point, mask
+instructions and gathers/scatters), guest OS context switches/signals, SMP,
+disk/device workloads and performance. XSAVES/XRSTORS and supervisor state
+remain outside the accepted CPU profile.
 
 Specification: Intel SDM Volume 2D, XSAVE/XSAVEOPT/XSAVEC/XRSTOR, and Volume 1,
 Chapter 13 (XSAVE-managed state).

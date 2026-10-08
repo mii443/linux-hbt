@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-/* Opt-in virtual XSTATE control plane. No vector instruction emulation. */
+/* Opt-in virtual XSTATE control plane; execution lives in the emulator. */
 #include <linux/kvm_host.h>
 
 #include "cpuid.h"

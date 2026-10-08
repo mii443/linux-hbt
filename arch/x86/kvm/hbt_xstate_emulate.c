@@ -177,3 +177,58 @@ out:
 	kfree(allocation);
 	return ret;
 }
+
+/* The caller holds the vCPU mutex. Keep fpregs_lock out of memory accesses
+ * and allocation. AVX2 accesses below only touch host-supported state.
+ */
+int kvm_hbt_vector_read(struct kvm_vcpu *vcpu, unsigned int reg, u32 data[16])
+{
+	struct kvm_hbt_xstate *soft = vcpu->arch.hbt_xstate;
+
+	if (!vcpu->kvm->arch.hbt_virtual_xstate_enabled || reg >= 32 ||
+	    !vcpu->arch.guest_fpu.fpstate->in_use || is_guest_mode(vcpu))
+		return -EOPNOTSUPP;
+	memset(data, 0, 64);
+	if (reg < 16) {
+		kvm_read_avx_reg(reg, (avx256_t *)data);
+		if (soft)
+			memcpy(data + 8, soft->zmm_hi[reg], 32);
+	} else if (soft) {
+		memcpy(data, soft->hi16_zmm[reg - 16], 64);
+	}
+	return 0;
+}
+
+int kvm_hbt_vector_write(struct kvm_vcpu *vcpu, unsigned int reg, const u32 data[16])
+{
+	struct kvm_hbt_xstate *soft = vcpu->arch.hbt_xstate;
+
+	if (!vcpu->kvm->arch.hbt_virtual_xstate_enabled || reg >= 32 ||
+	    !vcpu->arch.guest_fpu.fpstate->in_use || is_guest_mode(vcpu))
+		return -EOPNOTSUPP;
+	if (!soft) {
+		soft = kzalloc_obj(*soft, GFP_KERNEL_ACCOUNT);
+		if (!soft)
+			return -ENOMEM;
+		soft->version = KVM_HBT_XSTATE_VERSION;
+		soft->size = sizeof(*soft);
+		soft->xfeatures = KVM_HBT_XSTATE_FEATURES;
+		vcpu->arch.hbt_xstate = soft;
+	}
+	if (reg < 16) {
+		kvm_write_avx_reg(reg, (const avx256_t *)data);
+		memcpy(soft->zmm_hi[reg], data + 8, 32);
+		soft->xinuse |= HBT_XSTATE_ZMM_HI;
+	} else {
+		memcpy(soft->hi16_zmm[reg - 16], data, 64);
+		soft->xinuse |= HBT_XSTATE_HI16;
+	}
+	return 0;
+}
+
+u64 kvm_hbt_opmask_read(struct kvm_vcpu *vcpu, unsigned int reg)
+{
+	if (reg >= 8 || !vcpu->arch.hbt_xstate)
+		return 0;
+	return get_unaligned_le64(vcpu->arch.hbt_xstate->opmask[reg]);
+}
