@@ -2220,8 +2220,8 @@ u64 vcpu_tsc_khz(struct kvm_vcpu *vcpu);
 #define EMULTYPE_COMPLETE_USER_EXIT (1 << 7)
 #define EMULTYPE_WRITE_PF_TO_SP	    (1 << 8)
 #define EMULTYPE_SKIP_SOFT_INT	    (1 << 9)
-/* With TRAP_UD, also permit XGETBV/XSETBV for the opt-in HBT control path. */
-#define EMULTYPE_HBT_XCR		    (1 << 10)
+/* With TRAP_UD, permit the opt-in HBT XCR and XSAVE-family instructions. */
+#define EMULTYPE_HBT_XSTATE	    (1 << 10)
 
 #define EMULTYPE_SET_SOFT_INT_VECTOR(v)	((u32)((v) & 0xff) << 16)
 #define EMULTYPE_GET_SOFT_INT_VECTOR(e)	(((e) >> 16) & 0xff)

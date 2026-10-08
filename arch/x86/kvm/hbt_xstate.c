@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-/* Host-independent XSAVE64/XRSTOR64 codec for the HBT virtual CPU. */
+/* Host-independent XSAVE/XRSTOR codec for the HBT virtual CPU. */
 #include <linux/errno.h>
 #include <linux/string.h>
 #include <linux/unaligned.h>
@@ -7,6 +7,17 @@
 #include "hbt_xstate.h"
 
 static const u32 component_size[8] = { 0, 0, 256, 0, 0, 64, 512, 1024 };
+
+static u32 access_size(const struct hbt_xstate_layout *layout, unsigned int i)
+{
+	if (layout->legacy_mode) {
+		if (i == 7)
+			return 0;
+		if (i == 2 || i == 6)
+			return component_size[i] / 2;
+	}
+	return component_size[i];
+}
 
 /* AMD MXCSR.MM is bit 17. Only the virtual CPU's mask may enable it. */
 #define HBT_MXCSR_KNOWN_MASK 0x0002ffffU
@@ -142,7 +153,8 @@ int hbt_xstate_save(const struct hbt_xstate_layout *layout,
 		}
 	}
 	if (written & HBT_XSTATE_SSE) {
-		ret = io->write(io->opaque, 160, state->legacy + 160, 256);
+		ret = io->write(io->opaque, 160, state->legacy + 160,
+				layout->legacy_mode ? 128 : 256);
 		if (ret)
 			return ret;
 	}
@@ -155,10 +167,10 @@ int hbt_xstate_save(const struct hbt_xstate_layout *layout,
 	}
 	offsets(layout, mask, compacted, offset);
 	for (i = 2; i < 8; i++) {
-		if (!(written & (1ULL << i)))
+		if (!(written & (1ULL << i)) || !access_size(layout, i))
 			continue;
 		ret = io->write(io->opaque, offset[i],
-				component((struct hbt_xstate *)state, i), component_size[i]);
+				component((struct hbt_xstate *)state, i), access_size(layout, i));
 		if (ret)
 			return ret;
 	}
@@ -229,24 +241,31 @@ int hbt_xstate_restore(const struct hbt_xstate_layout *layout,
 		put_unaligned_le32(0x1f80, result->legacy + 24);
 	}
 	if (mask & HBT_XSTATE_SSE) {
-		memset(result->legacy + 160, 0, 256);
+		memset(result->legacy + 160, 0, layout->legacy_mode ? 128 : 256);
 		if (load & HBT_XSTATE_SSE) {
-			ret = io->read(io->opaque, 160, result->legacy + 160, 256);
+			ret = io->read(io->opaque, 160, result->legacy + 160,
+					layout->legacy_mode ? 128 : 256);
 			if (ret)
 				return ret;
 		}
 	}
 	offsets(layout, comp, compacted, offset);
 	for (i = 2; i < 8; i++) {
-		if (!(mask & (1ULL << i)))
+		if (!(mask & (1ULL << i)) || !access_size(layout, i))
 			continue;
-		memset(component(result, i), 0, component_size[i]);
+		memset(component(result, i), 0, access_size(layout, i));
 		if (!(load & (1ULL << i)))
 			continue;
-		ret = io->read(io->opaque, offset[i], component(result, i), component_size[i]);
+		ret = io->read(io->opaque, offset[i], component(result, i), access_size(layout, i));
 		if (ret)
 			return ret;
 	}
 	result->xinuse = (state->xinuse & ~mask) | load;
+	/* Inaccessible upper registers survive a legacy-mode restore. Keep
+	 * conservative in-use tracking so a later 64-bit save retains them.
+	 */
+	if (layout->legacy_mode)
+		result->xinuse |= state->xinuse & mask &
+			(HBT_XSTATE_SSE | HBT_XSTATE_YMM | HBT_XSTATE_ZMM_HI | HBT_XSTATE_HI16);
 	return 0;
 }

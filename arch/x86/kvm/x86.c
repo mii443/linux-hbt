@@ -8148,6 +8148,18 @@ out:
 	return r;
 }
 
+static int emulator_read_std_for_write(struct x86_emulate_ctxt *ctxt,
+				       gva_t addr, void *val, unsigned int bytes,
+				       struct x86_exception *exception)
+{
+	struct kvm_vcpu *vcpu = emul_to_vcpu(ctxt);
+	u64 access = PFERR_WRITE_MASK;
+
+	if (kvm_x86_call(get_cpl)(vcpu) == 3)
+		access |= PFERR_USER_MASK;
+	return kvm_read_guest_virt_helper(addr, val, bytes, vcpu, access, exception);
+}
+
 static int emulator_write_std(struct x86_emulate_ctxt *ctxt, gva_t addr, void *val,
 			      unsigned int bytes, struct x86_exception *exception,
 			      bool system)
@@ -8192,7 +8204,7 @@ int handle_ud(struct kvm_vcpu *vcpu)
 	int r;
 
 	if (vcpu->kvm->arch.hbt_virtual_xstate_enabled)
-		emul_type |= EMULTYPE_HBT_XCR;
+		emul_type |= EMULTYPE_HBT_XSTATE;
 
 	r = kvm_check_emulate_insn(vcpu, emul_type, NULL, 0);
 	if (r != X86EMUL_CONTINUE)
@@ -9043,6 +9055,13 @@ static int emulator_set_xcr(struct x86_emulate_ctxt *ctxt, u32 index, u64 xcr)
 	return __kvm_set_xcr(emul_to_vcpu(ctxt), index, xcr);
 }
 
+static int emulator_hbt_xstate(struct x86_emulate_ctxt *ctxt, enum hbt_xstate_format op,
+			       u64 requested, bool mode64, bool rex_w,
+			       const struct hbt_xstate_io *io)
+{
+	return kvm_hbt_emulate_xstate(emul_to_vcpu(ctxt), op, requested, mode64, rex_w, io);
+}
+
 static void emulator_vm_bugged(struct x86_emulate_ctxt *ctxt)
 {
 	struct kvm *kvm = emul_to_vcpu(ctxt)->kvm;
@@ -9077,6 +9096,7 @@ static const struct x86_emulate_ops emulate_ops = {
 	.read_gpr            = emulator_read_gpr,
 	.write_gpr           = emulator_write_gpr,
 	.read_std            = emulator_read_std,
+	.read_std_for_write  = emulator_read_std_for_write,
 	.write_std           = emulator_write_std,
 	.fetch               = kvm_fetch_guest_virt,
 	.read_emulated       = emulator_read_emulated,
@@ -9117,6 +9137,7 @@ static const struct x86_emulate_ops emulate_ops = {
 	.triple_fault        = emulator_triple_fault,
 	.get_xcr             = emulator_get_xcr,
 	.set_xcr             = emulator_set_xcr,
+	.hbt_xstate          = emulator_hbt_xstate,
 	.get_untagged_addr   = emulator_get_untagged_addr,
 	.is_canonical_addr   = emulator_is_canonical_addr,
 	.page_address_valid  = emulator_page_address_valid,

@@ -18,7 +18,7 @@
 struct hbt_xstate {
 	u64 xcr0;
 	u64 xinuse;
-	u8 legacy[512]; /* REX.W=1 legacy representation; no XSAVE header. */
+	u8 legacy[512]; /* Caller-selected x87 pointer format; no XSAVE header. */
 	u8 ymm_hi[16][16];
 	u8 opmask[8][8];
 	u8 zmm_hi[16][32];
@@ -32,6 +32,7 @@ struct hbt_xstate_layout {
 	u32 align64;   /* CPUID.0D.i:ECX[1], indexed by component. */
 	u32 mxcsr_mask; /* Virtual CPU policy, including optional AMD MM (bit 17). */
 	bool compacted;
+	bool legacy_mode; /* Outside 64-bit mode: only vector registers 0..7. */
 };
 
 /* Offsets are relative to the guest's XSAVE area, not host pointers.
@@ -48,6 +49,7 @@ enum hbt_xstate_format {
 	HBT_XSAVE,
 	HBT_XSAVEOPT,
 	HBT_XSAVEC,
+	HBT_XRSTOR,
 };
 
 void hbt_xstate_init(struct hbt_xstate *state);

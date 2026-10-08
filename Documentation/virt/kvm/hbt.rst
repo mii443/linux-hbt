@@ -112,9 +112,9 @@ XGETBV/XSETBV and KVM_GET/SET_XCRS use virtual XCR0; hardware XCR0 and the
 native KVM_GET/SET_XSAVE ABI remain limited to x87/SSE/YMM. VMX forces actual
 CR4.OSXSAVE=0 while preserving its guest-visible read shadow.
 
-Guest vector and XSAVE-family instruction emulation is not implemented by
-this capability. Those instructions continue to fault with #UD, so this
-is not a complete AVX-512 guest CPU or a migration-enablement switch.
+Guest XSAVE/XRSTOR, XSAVEOPT and XSAVEC are emulated with native FPU and
+software AVX-512 state synchronization. Vector instructions continue to
+fault with #UD; this is not a complete AVX-512 guest CPU or a migration switch.
 See ``hbt-xstate.rst`` for the required CPUID profile, semantics and tests.
 
 KVM_HBT_GET_XSTATE / KVM_HBT_SET_XSTATE

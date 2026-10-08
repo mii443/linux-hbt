@@ -3798,6 +3798,130 @@ out:
 	return rc;
 }
 
+struct hbt_xstate_access {
+	struct x86_emulate_ctxt *ctxt;
+	int rc;
+	bool saving;
+};
+
+static int hbt_xstate_access(void *opaque, u32 offset, void *data, u32 size, bool write)
+{
+	struct hbt_xstate_access *access = opaque;
+	struct x86_emulate_ctxt *ctxt = access->ctxt;
+	struct segmented_address addr = ctxt->memop.addr.mem;
+	struct segmented_address end;
+	ulong linear, last;
+
+	/* Apply address-size truncation to the decoded base, not separately to
+	 * each component. Linearization checks the entire accessed component.
+	 */
+	if (addr.ea + offset < addr.ea)
+		goto bad_address;
+	addr.ea += offset;
+	end = addr;
+	end.ea += size - 1;
+	if (end.ea < addr.ea)
+		goto bad_address;
+	access->rc = linearize(ctxt, addr, size, access->saving, &linear);
+	if (access->rc != X86EMUL_CONTINUE)
+		return -EFAULT;
+	access->rc = linearize(ctxt, end, 1, access->saving, &last);
+	if (access->rc != X86EMUL_CONTINUE)
+		return -EFAULT;
+	if (write)
+		access->rc = ctxt->ops->write_std(ctxt, linear, data, size,
+						&ctxt->exception, false);
+	else if (access->saving)
+		access->rc = ctxt->ops->read_std_for_write(ctxt, linear, data, size,
+							 &ctxt->exception);
+	else
+		access->rc = ctxt->ops->read_std(ctxt, linear, data, size, &ctxt->exception, false);
+	/* Standard-memory helpers do not construct resumable MMIO fragments. */
+	if (access->rc == X86EMUL_IO_NEEDED)
+		access->rc = X86EMUL_UNHANDLEABLE;
+	return access->rc == X86EMUL_CONTINUE ? 0 : -EFAULT;
+bad_address:
+	access->rc = addr.seg == VCPU_SREG_SS ? emulate_ss(ctxt, 0) : emulate_gp(ctxt, 0);
+	return -EFAULT;
+}
+
+static int hbt_xstate_read(void *opaque, u32 offset, void *data, u32 size)
+{
+	return hbt_xstate_access(opaque, offset, data, size, false);
+}
+
+static int hbt_xstate_write(void *opaque, u32 offset, const void *data, u32 size)
+{
+	return hbt_xstate_access(opaque, offset, (void *)data, size, true);
+}
+
+static int em_hbt_xstate(struct x86_emulate_ctxt *ctxt, enum hbt_xstate_format op)
+{
+	struct hbt_xstate_access access = {
+		.ctxt = ctxt, .rc = X86EMUL_CONTINUE, .saving = op != HBT_XRSTOR,
+	};
+	const struct hbt_xstate_io io = {
+		.read = hbt_xstate_read, .write = hbt_xstate_write, .opaque = &access,
+	};
+	u32 eax = 1, ebx, ecx = 0, edx;
+	u64 requested;
+	ulong linear;
+	int ret;
+
+	/* F3 0F AE /4 is PTWRITE; 66 0F AE /6 is CLWB, not XSAVEOPT. */
+	if (ctxt->rep_prefix || (op == HBT_XSAVEOPT && ctxt->op_prefix) ||
+	    !(ctxt->ops->get_cr(ctxt, 4) & X86_CR4_OSXSAVE))
+		return emulate_ud(ctxt);
+	ctxt->ops->get_cpuid(ctxt, &eax, &ebx, &ecx, &edx, true);
+	if (!(ecx & BIT(26)))
+		return emulate_ud(ctxt);
+	if (op == HBT_XSAVEOPT || op == HBT_XSAVEC) {
+		eax = 0xd;
+		ecx = 1;
+		ctxt->ops->get_cpuid(ctxt, &eax, &ebx, &ecx, &edx, true);
+		if (!(eax & BIT(op == HBT_XSAVEOPT ? 0 : 1)))
+			return emulate_ud(ctxt);
+	}
+	/* XSAVE-family instructions ignore CR0.EM; TS still causes #NM. */
+	if (ctxt->ops->get_cr(ctxt, 0) & X86_CR0_TS)
+		return emulate_nm(ctxt);
+	ret = linearize(ctxt, ctxt->memop.addr.mem, 1, op != HBT_XRSTOR, &linear);
+	if (ret != X86EMUL_CONTINUE)
+		return ret;
+	if (linear & 63)
+		return emulate_gp(ctxt, 0);
+	requested = (u32)reg_read(ctxt, VCPU_REGS_RAX) |
+		    ((u64)(u32)reg_read(ctxt, VCPU_REGS_RDX) << 32);
+	ret = ctxt->ops->hbt_xstate(ctxt, op, requested,
+				    ctxt->mode == X86EMUL_MODE_PROT64,
+				    !!(ctxt->rex_bits & REX_W), &io);
+	if (access.rc != X86EMUL_CONTINUE)
+		return access.rc;
+	if (ret == -EINVAL)
+		return emulate_gp(ctxt, 0);
+	return ret ? X86EMUL_UNHANDLEABLE : X86EMUL_CONTINUE;
+}
+
+static int em_xsave(struct x86_emulate_ctxt *ctxt)
+{
+	return em_hbt_xstate(ctxt, HBT_XSAVE);
+}
+
+static int em_xsaveopt(struct x86_emulate_ctxt *ctxt)
+{
+	return em_hbt_xstate(ctxt, HBT_XSAVEOPT);
+}
+
+static int em_xsavec(struct x86_emulate_ctxt *ctxt)
+{
+	return em_hbt_xstate(ctxt, HBT_XSAVEC);
+}
+
+static int em_xrstor(struct x86_emulate_ctxt *ctxt)
+{
+	return em_hbt_xstate(ctxt, HBT_XRSTOR);
+}
+
 static int em_xgetbv(struct x86_emulate_ctxt *ctxt)
 {
 	u64 value;
@@ -4123,7 +4247,8 @@ static const struct gprefix pfx_0f_c7_7 = {
 
 
 static const struct group_dual group9 = { {
-	N, I(DstMem64 | Lock | PageTable, em_cmpxchg8b), N, N, N, N, N, N,
+	N, I(DstMem64 | Lock | PageTable, em_cmpxchg8b), N, N,
+	I(ModRM | Unaligned, em_xsavec), N, N, N,
 }, {
 	N, N, N, N, N, N, N,
 	GP(0, &pfx_0f_c7_7),
@@ -4141,7 +4266,8 @@ static const struct gprefix pfx_0f_ae_7 = {
 static const struct group_dual group15 = { {
 	I(ModRM | Aligned16, em_fxsave),
 	I(ModRM | Aligned16, em_fxrstor),
-	N, N, N, N, N, GP(0, &pfx_0f_ae_7),
+	N, N, I(ModRM | Unaligned, em_xsave), I(ModRM | Unaligned, em_xrstor),
+	I(ModRM | Unaligned, em_xsaveopt), GP(0, &pfx_0f_ae_7),
 }, {
 	N, N, N, N, N, N, N, N,
 } };
@@ -5139,8 +5265,10 @@ done_modrm:
 
 	if (unlikely(emulation_type & EMULTYPE_TRAP_UD) &&
 	    likely(!(ctxt->d & EmulateOnUD)) &&
-	    !((emulation_type & EMULTYPE_HBT_XCR) &&
-	      (ctxt->execute == em_xgetbv || ctxt->execute == em_xsetbv)))
+	    !((emulation_type & EMULTYPE_HBT_XSTATE) &&
+	      (ctxt->execute == em_xgetbv || ctxt->execute == em_xsetbv ||
+	       ctxt->execute == em_xsave || ctxt->execute == em_xsaveopt ||
+	       ctxt->execute == em_xsavec || ctxt->execute == em_xrstor)))
 		return EMULATION_FAILED;
 
 	if (unlikely(ctxt->d &

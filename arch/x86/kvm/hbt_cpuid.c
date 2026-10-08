@@ -11,7 +11,27 @@ bool kvm_hbt_virtual_xstate_supported(void)
 {
 	return kvm_caps.has_hbt_ud &&
 	       (kvm_caps.supported_xcr0 & 7) == 7 &&
+	       xstate_required_size(7, false) == 832 &&
 	       kvm_cpu_cap_has(X86_FEATURE_AVX2);
+}
+
+u32 kvm_hbt_xstate_compacted_size(struct kvm_vcpu *vcpu, u64 mask)
+{
+	struct kvm_cpuid_entry2 *entry;
+	u32 size = 576;
+	unsigned int i;
+
+	for (i = 2; i < 8; i++) {
+		if (!(mask & BIT_ULL(i)))
+			continue;
+		entry = kvm_find_cpuid_entry_index(vcpu, 0xd, i);
+		if (entry) {
+			if (entry->ecx & 2)
+				size = ALIGN(size, 64);
+			size += entry->eax;
+		}
+	}
+	return size;
 }
 
 u32 kvm_hbt_xstate_size(struct kvm_vcpu *vcpu, u64 mask)
@@ -75,6 +95,11 @@ int kvm_hbt_check_cpuid(struct kvm_vcpu *vcpu)
 		if (entry->index == 0) {
 			if (entry->eax != HBT_XSTATE_SUPPORTED || entry->edx)
 				return -EINVAL;
+		} else if (entry->index == 1) {
+			/* Software XSAVEOPT/XSAVEC; EBX is recomputed at runtime. */
+			if ((entry->eax & ~3U) || entry->ecx || entry->edx ||
+			    (!(entry->eax & 2) && entry->ebx))
+				return -EINVAL;
 		} else if (entry->index < 8 && sizes[entry->index]) {
 			if (entry->eax != sizes[entry->index] ||
 			    (entry->ecx & ~2U) || entry->edx)
@@ -83,7 +108,6 @@ int kvm_hbt_check_cpuid(struct kvm_vcpu *vcpu)
 			if (entry->ecx & 2)
 				layout.align64 |= BIT(entry->index);
 		} else if (entry->eax || entry->ebx || entry->ecx || entry->edx) {
-			/* Including subleaf 1: base XSAVE/XRSTOR only in v1. */
 			return -EINVAL;
 		}
 	}

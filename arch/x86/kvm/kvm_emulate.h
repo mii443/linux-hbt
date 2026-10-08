@@ -14,6 +14,7 @@
 
 #include <asm/desc_defs.h>
 #include "fpu.h"
+#include "hbt_xstate.h"
 
 struct x86_emulate_ctxt;
 enum x86_intercept;
@@ -129,6 +130,12 @@ struct x86_emulate_ops {
 			unsigned long addr, void *val,
 			unsigned int bytes,
 			struct x86_exception *fault, bool system);
+	/* Read a read/modify/write operand, checking write permission and
+	 * reporting write faults even if its initial read faults (XSAVE header).
+	 */
+	int (*read_std_for_write)(struct x86_emulate_ctxt *ctxt,
+				 unsigned long addr, void *val, unsigned int bytes,
+				 struct x86_exception *fault);
 
 	/*
 	 * write_std: Write bytes of standard (non-emulated/special) memory.
@@ -239,6 +246,9 @@ struct x86_emulate_ops {
 	void (*triple_fault)(struct x86_emulate_ctxt *ctxt);
 	int (*get_xcr)(struct x86_emulate_ctxt *ctxt, u32 index, u64 *xcr);
 	int (*set_xcr)(struct x86_emulate_ctxt *ctxt, u32 index, u64 xcr);
+	int (*hbt_xstate)(struct x86_emulate_ctxt *ctxt, enum hbt_xstate_format op,
+			  u64 requested, bool mode64, bool rex_w,
+			  const struct hbt_xstate_io *io);
 
 	gva_t (*get_untagged_addr)(struct x86_emulate_ctxt *ctxt, gva_t addr,
 				   unsigned int flags);

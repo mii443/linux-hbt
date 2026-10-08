@@ -324,8 +324,10 @@ static void kvm_update_cpuid_runtime(struct kvm_vcpu *vcpu)
 	best = kvm_find_cpuid_entry_index(vcpu, 0xD, 1);
 	if (best && (cpuid_entry_has(best, X86_FEATURE_XSAVES) ||
 		     cpuid_entry_has(best, X86_FEATURE_XSAVEC)))
-		best->ebx = xstate_required_size(vcpu->arch.xcr0 |
-						 vcpu->arch.ia32_xss, true);
+		best->ebx = vcpu->kvm->arch.hbt_virtual_xstate_enabled ?
+			kvm_hbt_xstate_compacted_size(vcpu, vcpu->arch.xcr0) :
+			xstate_required_size(vcpu->arch.xcr0 |
+					     vcpu->arch.ia32_xss, true);
 }
 
 static bool kvm_cpuid_has_hyperv(struct kvm_vcpu *vcpu)
