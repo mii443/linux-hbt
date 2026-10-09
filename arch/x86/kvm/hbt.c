@@ -86,6 +86,10 @@ bool kvm_hbt_prepare_ud(struct kvm_vcpu *vcpu)
 	    vcpu->arch.guest_state_protected ||
 	    vcpu->arch.complete_userspace_io || vcpu->arch.hbt)
 		return false;
+	/* The automatic EPTP experiment instruments ordinary user code only. */
+	if (vcpu->kvm->arch.hbt_virtual_xstate_enabled &&
+	    kvm_x86_call(get_cpl)(vcpu) != 3)
+		return false;
 	mode = kvm_hbt_mode(vcpu);
 	if (!mode)
 		return false;

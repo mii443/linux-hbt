@@ -14,6 +14,8 @@
 #define KVM_CAP_HBT_X86_VIRTUAL_XSTATE 0x48425406
 /* Query-only: bounded integer execution in virtual-XSTATE mode, not full ISA. */
 #define KVM_CAP_HBT_X86_INTEGER_VECTOR 0x48425407
+/* Single-vCPU #UD/RETRY dispatch combined with virtual XSTATE, without XOM. */
+#define KVM_CAP_HBT_X86_EPTP_DISPATCH 0x48425408
 #define KVM_EXIT_HBT_X86_UD	0x48425401
 #define KVM_HBT_ABI_VERSION	1
 #define KVM_HBT_MAX_BYTES	4096
@@ -164,6 +166,9 @@ struct kvm_hbt_xstate {
 #define KVM_HBT_EPTP_CONFIG 1
 #define KVM_HBT_EPTP_READ 2
 #define KVM_HBT_EPTP_DESTROY 3
+#define KVM_HBT_EPTP_PENDING_EVENT 0xffffffffU /* suberror: no VM entry */
+#define KVM_HBT_EPTP_LIVE_CONFIG 4
+#define KVM_HBT_EPTP_READ_MAPS 5
 #define KVM_HBT_EPTP_MAX_PAGES 512
 #define KVM_HBT_EPTP_MAX_OVERLAYS 16
 #define KVM_HBT_EPTP_UNDER_HYPERVISOR 1 /* QUERY output; timing is not L0 evidence */
@@ -174,6 +179,22 @@ struct kvm_hbt_eptp_overlay {
 	__u32 reserved;
 	__u64 image_addr;
 };
+
+/* LIVE_CONFIG bounds user RAM at GPA 0 by nr_pages (at most 1 GiB).
+ * Only explicitly listed RAM pages are pinned; all other GPAs are unmapped.
+ * Up to 16 mappings select pages: permissions bits 2:0 are N R/W/X, bits 10:8 H.
+ * A zero image pointer selects pinned RAM; nonzero copies a private page.
+ * Extra GPAs below 1 GiB are allowed only with private images. READ_MAPS
+ * uses an array of kvm_hbt_eptp_overlay as page/destination pairs, nr_pages
+ * and image_addr zero, and view 0/1. This remains an opt-in laboratory ABI.
+ */
+struct kvm_hbt_eptp_live_map {
+	__u32 page;
+	__u32 permissions;
+	__u64 normal_addr;
+	__u64 helper_addr;
+};
+#define KVM_HBT_EPTP_LIVE_MAX_PAGES (1U << 18)
 
 struct kvm_hbt_eptp_probe {
 	__u32 version;

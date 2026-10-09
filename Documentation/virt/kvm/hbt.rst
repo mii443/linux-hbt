@@ -332,3 +332,54 @@ without an ordinary pinned page, ESTALE for changed context/fetch translation
 or original bytes, EINVAL for a misaligned/wrong page or unsupported memslot,
 EBUSY for an existing XOM entry, and ENOMEM for allocation failures. A failed
 installation can be followed by normal FALLBACK completion.
+
+Bounded EPTP experiment
+----------------------
+
+``kvm_intel.hbt_eptp_probe=1`` enables the laboratory-only
+``KVM_HBT_EPTP_PROBE`` vCPU ioctl. CONFIG/READ copy a fixture of at most
+512 pages with at most 16 helper overlays. QUERY reports version/limits and
+whether execution is nested; its output ``view`` is the currently selected
+view. DESTROY drops the private views. Reserved fields must be zero.
+
+``KVM_CAP_HBT_X86_EPTP_DISPATCH`` additionally allows CPL3 #UD analysis/retry
+with virtual XSTATE. Enable virtual XSTATE first, then this capability before
+creating vCPUs. It restricts the VM to one vCPU. It does not enable the old
+cooperative XOM interface, widen instruction semantics, or provide migration
+serialization for pending analysis requests.
+
+LIVE_CONFIG bounds a contiguous user RAM allocation at GPA 0 by ``nr_pages``
+(up to 1 GiB) but maps only the listed pages. Each live-map entry supplies a
+GPA page number, N permissions in bits 2:0, H permissions in bits 10:8, and
+optional N/H image addresses. A nonzero image address is copied to a private
+accounted page; a zero address with nonzero permissions pins the corresponding
+user RAM page. Unlisted GPAs are absent. Private pages may occupy otherwise
+unused GPAs below 1 GiB. Duplicate entries, write-without-read permissions,
+unknown bits and out-of-range RAM references are rejected. READ_MAPS copies
+selected private pages back to userspace using page/destination pairs in the
+old overlay structure. It requires zero ``nr_pages``/``image_addr`` and view
+0 or 1. READ of a live configuration is rejected.
+
+Both EPTs and the VMFUNC list are owned by the kernel. Original RAM references
+are obtained with GUP, never supplied as host physical addresses. A failed
+configuration releases every acquired pin and allocation. Teardown marks
+pinned RAM dirty and unpins it. This is not a memslot/MMU-notifier backend;
+the caller must keep RAM and mappings fixed, stop external memory writers,
+and discard the views before changing memory or saving CPU state.
+
+Every private hardware exit reports ``KVM_EXIT_HBT_EPTP`` and raw VMX reason,
+active view, qualification, instruction length, interrupt information and RIP
+in ``internal``. Ordinary VMCS controls/EPT are restored before userspace runs.
+Userspace must normalize helper registers and shadow vectors before allowing
+ordinary KVM execution. Guest exception emulation is deliberately bypassed
+until then. VMX nesting and SMM are rejected. An in-kernel IRQ chip requires
+``kvm_intel.enable_apicv=0`` so posted interrupts cannot expose helper state.
+
+Live entries use a private VMX preemption timer bounded to 100 microseconds
+of guest execution. Pending external IRQ injection is canceled for that
+slice and requeued after its exit, before ordinary guest execution can resume.
+Other pending entry events produce the synthetic suberror
+``KVM_HBT_EPTP_PENDING_EVENT`` without entering the guest. The private timer
+must not be interpreted as an expired guest LAPIC timer. These mechanisms
+support a bounded experiment, not arbitrary SMP, DMA, SMI, debug, reset or
+migration activity while a view is active.

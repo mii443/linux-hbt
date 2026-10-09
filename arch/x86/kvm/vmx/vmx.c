@@ -5415,15 +5415,14 @@ static int handle_exception_nmi(struct kvm_vcpu *vcpu)
 	if (is_invalid_opcode(intr_info)) {
 		int ret;
 
-		if (vcpu->kvm->arch.hbt_virtual_xstate_enabled)
-			return handle_ud(vcpu);
-
 		if (vcpu->kvm->arch.hbt_ud_enabled) {
 			if (!(vect_info & VECTORING_INFO_VALID_MASK) &&
 			    kvm_hbt_prepare_ud(vcpu))
 				return 0;
 			return handle_ud(vcpu);
 		}
+		if (vcpu->kvm->arch.hbt_virtual_xstate_enabled)
+			return handle_ud(vcpu);
 		if (!xom_skip_experiment)
 			return handle_ud(vcpu);
 		ret = vmx_handle_xom_ud(vcpu);
@@ -6104,7 +6103,7 @@ static int handle_invalid_guest_state(struct kvm_vcpu *vcpu)
 int vmx_vcpu_pre_run(struct kvm_vcpu *vcpu)
 {
 	if (unlikely(to_vmx(vcpu)->hbt_eptp) &&
-	    (irqchip_in_kernel(vcpu->kvm) || is_smm(vcpu) ||
+	    ((irqchip_in_kernel(vcpu->kvm) && enable_apicv) || is_smm(vcpu) ||
 	     is_guest_mode(vcpu) || to_vmx(vcpu)->nested.vmxon))
 		return -EOPNOTSUPP;
 
@@ -7652,6 +7651,9 @@ fastpath_t vmx_vcpu_run(struct kvm_vcpu *vcpu, u64 run_flags)
 	struct vcpu_vmx *vmx = to_vmx(vcpu);
 	unsigned long cr3, cr4;
 
+	if (unlikely(vmx->hbt_eptp) && vmx_hbt_eptp_pending_event(vmx))
+		return EXIT_FASTPATH_NONE;
+
 	/* Record the guest's net vcpu time for enforced NMI injections. */
 	if (unlikely(!enable_vnmi &&
 		     vmx->loaded_vmcs->soft_vnmi_blocked))
@@ -7800,8 +7802,10 @@ fastpath_t vmx_vcpu_run(struct kvm_vcpu *vcpu, u64 run_flags)
 	vmx_recover_nmi_blocking(vmx);
 	vmx_complete_interrupts(vmx);
 
-	if (unlikely(vmx->hbt_eptp))
+	if (unlikely(vmx->hbt_eptp)) {
+		vmx_hbt_eptp_complete_interrupts(vmx);
 		return EXIT_FASTPATH_NONE;
+	}
 	return vmx_exit_handlers_fastpath(vcpu, force_immediate_exit);
 }
 

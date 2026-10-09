@@ -4886,6 +4886,7 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
 			r = KVM_HBT_ABI_VERSION;
 		break;
 	case KVM_CAP_HBT_X86_INTEGER_VECTOR:
+	case KVM_CAP_HBT_X86_EPTP_DISPATCH:
 		if (kvm_hbt_virtual_xstate_supported() &&
 		    (!kvm || kvm->arch.vm_type == KVM_X86_DEFAULT_VM))
 			r = KVM_HBT_INTEGER_VECTOR_VERSION;
@@ -6984,9 +6985,27 @@ disable_exits_unlock:
 		}
 		mutex_unlock(&kvm->lock);
 		break;
+	case KVM_CAP_HBT_X86_EPTP_DISPATCH:
+		r = -EINVAL;
+		if (!kvm_hbt_virtual_xstate_supported() ||
+		    !kvm->arch.hbt_virtual_xstate_enabled ||
+		    cap->args[0] != KVM_HBT_ABI_VERSION ||
+		    cap->args[1] || cap->args[2] || cap->args[3])
+			break;
+		mutex_lock(&kvm->lock);
+		r = -EBUSY;
+		if (!kvm->created_vcpus && !kvm->arch.hbt_xom_enabled) {
+			kvm->arch.hbt_ud_enabled = true;
+			kvm->arch.hbt_retry_enabled = true;
+			kvm->max_vcpus = 1;
+			r = 0;
+		}
+		mutex_unlock(&kvm->lock);
+		break;
 	case KVM_CAP_HBT_X86_XOM:
 		r = -EINVAL;
 		if (!kvm_caps.has_hbt_xom || !kvm->arch.hbt_retry_enabled ||
+		    kvm->arch.hbt_virtual_xstate_enabled ||
 		    cap->args[0] != KVM_HBT_ABI_VERSION ||
 		    cap->args[1] || cap->args[2] || cap->args[3])
 			break;
