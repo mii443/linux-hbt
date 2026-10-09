@@ -84,6 +84,29 @@ static bool hbt_eptp_candidate(const u8 *p, unsigned int n)
 	       (n >= 5 && p[0] == 0xc4);
 }
 
+/* Fetch by guest virtual page: adjacent instruction bytes need not occupy
+ * adjacent guest physical pages. A missing following page ends the window.
+ */
+static unsigned int hbt_read_insn(struct kvm_vcpu *vcpu, unsigned long linear,
+				 u8 *bytes, unsigned int length)
+{
+	unsigned int done = 0;
+
+	while (done < length) {
+		struct x86_exception exception = {};
+		unsigned int chunk = min_t(unsigned int, length - done,
+					  PAGE_SIZE - offset_in_page(linear));
+		gpa_t gpa = kvm_mmu_gva_to_gpa_fetch(vcpu, linear, &exception);
+
+		if (gpa == INVALID_GPA ||
+		    kvm_vcpu_read_xom_guest(vcpu, gpa, bytes + done, chunk))
+			break;
+		done += chunk;
+		linear += chunk;
+	}
+	return done;
+}
+
 bool kvm_hbt_prepare_ud(struct kvm_vcpu *vcpu)
 {
 	struct x86_exception exception = {};
@@ -111,13 +134,11 @@ bool kvm_hbt_prepare_ud(struct kvm_vcpu *vcpu)
 	if (vcpu->kvm->arch.hbt_virtual_xstate_enabled) {
 		struct kvm_cpuid_entry2 *entry;
 		u8 prefix[6];
-		unsigned int n = min_t(unsigned int, sizeof(prefix),
-					PAGE_SIZE - offset_in_page(linear));
+		unsigned int n = hbt_read_insn(vcpu, linear, prefix, sizeof(prefix));
 
 		if (mode != 64 || !(kvm_read_cr4(vcpu) & X86_CR4_OSXSAVE) ||
 		    (kvm_read_cr0(vcpu) & (X86_CR0_EM | X86_CR0_TS)) ||
 		    (vcpu->arch.xcr0 & 6) != 6 ||
-		    kvm_vcpu_read_xom_guest(vcpu, gpa, prefix, n) ||
 		    !hbt_eptp_candidate(prefix, n))
 			return false;
 		entry = kvm_find_cpuid_entry_index(vcpu, 7, 0);
@@ -137,10 +158,18 @@ bool kvm_hbt_prepare_ud(struct kvm_vcpu *vcpu)
 	s->gpa = gpa;
 	s->cr3 = kvm_read_cr3(vcpu);
 	s->mode = mode;
-	s->data_len = KVM_HBT_MAX_BYTES - offset_in_page(linear);
-	if (kvm_vcpu_read_xom_guest(vcpu, gpa, s->data, s->data_len)) {
-		kfree(state);
-		return false;
+	if (vcpu->kvm->arch.hbt_virtual_xstate_enabled) {
+		s->data_len = hbt_read_insn(vcpu, linear, s->data, 15);
+		if (!s->data_len) {
+			kfree(state);
+			return false;
+		}
+	} else {
+		s->data_len = KVM_HBT_MAX_BYTES - offset_in_page(linear);
+		if (kvm_vcpu_read_xom_guest(vcpu, gpa, s->data, s->data_len)) {
+			kfree(state);
+			return false;
+		}
 	}
 	state->cr0 = kvm_read_cr0(vcpu);
 	state->cr4 = kvm_read_cr4(vcpu);
