@@ -30,6 +30,14 @@ access before reading the bytes. Other vCPUs and guest-memory writers may
 change memory during or after capture; this is not an atomic snapshot or a
 reservation for code placement.
 
+The virtual-XSTATE/EPTP dispatch mode instead captures at most 15 bytes. It
+walks each guest virtual page with instruction-fetch permissions, so an
+instruction may cross a page boundary without requiring physically adjacent
+guest pages. An unavailable following page shortens the window. ``gpa`` still
+identifies the first byte only; userspace must translate subsequent virtual
+pages separately before installing execution overlays. The ordinary XOM
+capture contract above remains unchanged.
+
 Nested/protected guests, 16-bit/vm86 execution, vectoring events and capture
 failures continue through normal #UD handling. The capability takes precedence
 over the separately enabled legacy VMX XOM skip experiment.
