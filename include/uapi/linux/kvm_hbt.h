@@ -178,6 +178,8 @@ struct kvm_hbt_xstate {
 #define KVM_HBT_EPTP_CACHE_CONFIG 9 /* LIVE_CONFIG with nonzero reserved[0] key */
 #define KVM_HBT_EPTP_CACHE_RESUME 10 /* resume the suspended reserved[0] key */
 #define KVM_HBT_EPTP_CACHE_DROP 11 /* discard an inactive reserved[0] key */
+#define KVM_HBT_EPTP_READ_RANGES 12 /* bounded private reads; returns active view */
+#define KVM_HBT_EPTP_RESUME_RANGES 13 /* refresh ranges; optional reserved[0] key */
 #define KVM_HBT_EPTP_MAX_CONTEXTS 64
 #define KVM_HBT_EPTP_MAX_PAGES 512
 #define KVM_HBT_EPTP_MAX_OVERLAYS 256
@@ -186,12 +188,29 @@ struct kvm_hbt_xstate {
 #define KVM_HBT_EPTP_LAZY_DATA 4 /* QUERY: MAP_DATA and exit data[6] GPA */
 #define KVM_HBT_EPTP_PERSISTENT 8 /* QUERY: SUSPEND/RESUME and larger map budget */
 #define KVM_HBT_EPTP_CONTEXT_CACHE 16 /* QUERY: keyed operations; reserved[0] limit */
+#define KVM_HBT_EPTP_RANGE_IO 32 /* QUERY: READ_RANGES/RESUME_RANGES */
 #define KVM_EXIT_HBT_EPTP 0x48425402
 
 struct kvm_hbt_eptp_overlay {
 	__u32 page;
 	__u32 reserved;
 	__u64 image_addr;
+};
+
+/* Range operations use overlays_addr/nr_overlays for this array, with all
+ * other arguments zero except an optional RESUME_RANGES context key. Each
+ * length is 1..4096, offset+length <= 4096, view is 0/1, flags must be zero.
+ * Reads require private backing; resume writes additionally require W in
+ * the selected view. Unlisted bytes stay unchanged. All descriptors are
+ * validated before copying. A failed refresh leaves the context inactive;
+ * successfully copied prefixes may have changed and must be refreshed on retry.
+ * The VMM must still validate code/PTEs and supply current canonical state.
+ */
+struct kvm_hbt_eptp_range {
+	__u32 page;
+	__u16 offset, length;
+	__u64 image_addr;
+	__u32 view, flags;
 };
 
 /* LIVE_CONFIG bounds user RAM at GPA 0 by nr_pages (at most 1 GiB).
