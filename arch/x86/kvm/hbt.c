@@ -79,27 +79,9 @@ void kvm_hbt_reset(struct kvm_vcpu *vcpu)
  */
 static bool hbt_eptp_candidate(const u8 *p, unsigned int n)
 {
-	unsigned int map, pp, op;
-
-	if (n >= 6 && p[0] == 0x62)
-		return (p[1] & 0x5f) == 0x51 && (p[2] & 0x87) == 5 &&
-		       (p[3] & 0x9f) == 8 && (p[3] & 0x60) != 0x60 &&
-		       (p[4] == 0xef || p[4] == 0xfe) && (p[5] & 0xc0) == 0xc0;
-	if (n >= 4 && p[0] == 0xc5) {
-		map = 1; pp = p[1] & 3; op = p[2];
-	} else if (n >= 5 && p[0] == 0xc4) {
-		map = p[1] & 0x1f; pp = p[2] & 3; op = p[3];
-	} else {
-		return false;
-	}
-	if (map == 3 && pp == 1)
-		return op == 0x18 || op == 0x38 || op == 0x22;
-	if (map != 1)
-		return false;
-	return op == 0x10 || op == 0x28 || op == 0x2a ||
-	       (op >= 0x54 && op <= 0x59) || op == 0x5c || op == 0x5e ||
-	       op == 0x6c || op == 0x6e || op == 0x6f || op == 0x7e ||
-	       op == 0xd4 || op == 0xef || op == 0xfc || op == 0xfd || op == 0xfe;
+	/* Operand/feature validation remains in the userspace direct compiler. */
+	return (n >= 6 && p[0] == 0x62) || (n >= 4 && p[0] == 0xc5) ||
+	       (n >= 5 && p[0] == 0xc4);
 }
 
 bool kvm_hbt_prepare_ud(struct kvm_vcpu *vcpu)

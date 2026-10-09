@@ -19,6 +19,8 @@
 #include "../x86.h"
 #include "../smm.h"
 
+#define HBT_LAZY_DATA_PAGES 256
+
 static bool __read_mostly hbt_eptp_probe;
 module_param(hbt_eptp_probe, bool, 0444);
 MODULE_PARM_DESC(hbt_eptp_probe, "Enable the bounded HBT VMFUNC test interface");
@@ -38,6 +40,8 @@ struct vmx_hbt_eptp {
 	bool live;
 	struct page **pinned;
 	u32 pinned_count, map_count;
+	u64 ram_hva;
+	u32 ram_pages, data_count, data_pages[HBT_LAZY_DATA_PAGES];
 	u64 *live_pts[2][512];
 	struct kvm_hbt_eptp_live_map maps[KVM_HBT_EPTP_MAX_OVERLAYS];
 	void *map_pages[2][KVM_HBT_EPTP_MAX_OVERLAYS];
@@ -216,6 +220,8 @@ static int configure_live(struct vcpu_vmx *vmx, struct kvm_hbt_eptp_probe *req)
 	if (!p)
 		return -ENOMEM;
 	p->live = true;
+	p->ram_hva = req->image_addr;
+	p->ram_pages = req->nr_pages;
 	p->map_count = req->nr_overlays;
 	if (copy_from_user(p->maps, u64_to_user_ptr(req->overlays_addr),
 			   p->map_count * sizeof(p->maps[0]))) {
@@ -240,7 +246,8 @@ static int configure_live(struct vcpu_vmx *vmx, struct kvm_hbt_eptp_probe *req)
 				goto fail;
 		}
 	}
-	p->pinned = kvmalloc_array(p->map_count, sizeof(*p->pinned), GFP_KERNEL_ACCOUNT);
+	p->pinned = kvmalloc_array(p->map_count + HBT_LAZY_DATA_PAGES,
+				  sizeof(*p->pinned), GFP_KERNEL_ACCOUNT);
 	if (!p->pinned) {
 		ret = -ENOMEM;
 		goto fail;
@@ -311,6 +318,46 @@ fail:
 	return ret;
 }
 
+/* Add ordinary RAM as data only. Explicit overlays keep their permissions;
+ * code writes and all instruction fetches still require canonical recovery.
+ * The VMM's original LIVE_CONFIG image bounds every userspace pin.
+ */
+static int map_live_data(struct kvm_vcpu *vcpu, struct vmx_hbt_eptp *p,
+			 struct kvm_hbt_eptp_probe *req)
+{
+	unsigned int page = req->nr_pages, i;
+	struct page *pinned;
+	long count;
+	int ret;
+
+	if (!p || !p->live || page >= p->ram_pages || req->view ||
+	    req->image_addr || req->overlays_addr || req->nr_overlays)
+		return -EINVAL;
+	for (i = 0; i < p->map_count; i++)
+		if (p->maps[i].page == page)
+			return -EPERM;
+	for (i = 0; i < p->data_count; i++)
+		if (p->data_pages[i] == page)
+			return 0;
+	if (p->data_count == HBT_LAZY_DATA_PAGES)
+		return -ENOSPC;
+	count = pin_user_pages_fast(p->ram_hva + (u64)page * PAGE_SIZE, 1,
+				   FOLL_WRITE | FOLL_LONGTERM, &pinned);
+	if (count != 1)
+		return count < 0 ? count : -EFAULT;
+	p->pinned[p->pinned_count++] = pinned;
+	p->data_pages[p->data_count++] = page;
+	for (i = 0; i < 2; i++) {
+		ret = live_leaf(p, i, page, page_to_phys(pinned) | 0x73);
+		if (ret)
+			return ret;
+	}
+	kvm_vcpu_srcu_read_lock(vcpu);
+	kvm_vcpu_mark_page_dirty(vcpu, page);
+	kvm_vcpu_srcu_read_unlock(vcpu);
+	return 0;
+}
+
 static int read_maps(struct vmx_hbt_eptp *p, struct kvm_hbt_eptp_probe *req)
 {
 	struct kvm_hbt_eptp_overlay maps[KVM_HBT_EPTP_MAX_OVERLAYS];
@@ -370,12 +417,14 @@ long vmx_hbt_eptp_probe(struct kvm_vcpu *vcpu, void __user *argp)
 		req.nr_overlays = KVM_HBT_EPTP_MAX_OVERLAYS;
 		req.view = p ? p->view : 0;
 		req.flags = boot_cpu_has(X86_FEATURE_HYPERVISOR) ? KVM_HBT_EPTP_UNDER_HYPERVISOR : 0;
-		req.flags |= KVM_HBT_EPTP_SHARED_OVERLAY;
+		req.flags |= KVM_HBT_EPTP_SHARED_OVERLAY | KVM_HBT_EPTP_LAZY_DATA;
 		return copy_to_user(argp, &req, sizeof(req)) ? -EFAULT : 0;
 	case KVM_HBT_EPTP_CONFIG:
 		return configure_probe(vmx, &req);
 	case KVM_HBT_EPTP_LIVE_CONFIG:
 		return configure_live(vmx, &req);
+	case KVM_HBT_EPTP_MAP_DATA:
+		return map_live_data(vcpu, p, &req);
 	case KVM_HBT_EPTP_READ_MAPS:
 		return read_maps(p, &req);
 	case KVM_HBT_EPTP_READ:
@@ -493,13 +542,14 @@ int vmx_hbt_eptp_exit(struct vcpu_vmx *vmx)
 		vmx->hbt_eptp->pending_event = false;
 		run->exit_reason = KVM_EXIT_HBT_EPTP;
 		run->internal.suberror = KVM_HBT_EPTP_PENDING_EVENT;
-		run->internal.ndata = 6;
+		run->internal.ndata = 7;
 		run->internal.data[0] = vmx->hbt_eptp->view;
 		run->internal.data[1] = 0;
 		run->internal.data[2] = 0;
 		run->internal.data[3] = vmcs_read32(VM_ENTRY_INTR_INFO_FIELD);
 		run->internal.data[4] = kvm_rip_read(vcpu);
 		run->internal.data[5] = 1;
+		run->internal.data[6] = 0;
 		return 0;
 	}
 	if (!vmx->hbt_eptp->entered || vmx->fail || vmx_get_exit_reason(vcpu).failed_vmentry) {
@@ -511,12 +561,14 @@ int vmx_hbt_eptp_exit(struct vcpu_vmx *vmx)
 	vmx->hbt_eptp->entered = false;
 	run->exit_reason = KVM_EXIT_HBT_EPTP;
 	run->internal.suberror = vmx_get_exit_reason(vcpu).full;
-	run->internal.ndata = 6;
+	run->internal.ndata = 7;
 	run->internal.data[0] = vmx->hbt_eptp->view;
 	run->internal.data[1] = vmcs_readl(EXIT_QUALIFICATION);
 	run->internal.data[2] = vmcs_read32(VM_EXIT_INSTRUCTION_LEN);
 	run->internal.data[3] = vmcs_read32(VM_EXIT_INTR_INFO);
 	run->internal.data[4] = kvm_rip_read(vcpu);
 	run->internal.data[5] = vmx->hbt_eptp->must_recover;
+	run->internal.data[6] = vmx_get_exit_reason(vcpu).basic == EXIT_REASON_EPT_VIOLATION ?
+		vmcs_read64(GUEST_PHYSICAL_ADDRESS) : 0;
 	return 0;
 }

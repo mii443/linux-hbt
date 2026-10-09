@@ -161,7 +161,8 @@ struct kvm_hbt_xstate {
  * qualification, instruction length, interrupt information, guest RIP.
  * ndata >= 6: data[5] requires recovery for a deferred guest event. A private
  * slice-timer exit (reason 52) with data[5] == 0 can resume the existing views.
- * No physical addresses are accepted from or returned to userspace.
+ * With LAZY_DATA, ndata >= 7: data[6] is the guest physical address of an
+ * EPT violation (zero for other exits). No host physical address is exposed.
  */
 #define KVM_HBT_EPTP_VERSION 1
 #define KVM_HBT_EPTP_QUERY 0
@@ -171,10 +172,12 @@ struct kvm_hbt_xstate {
 #define KVM_HBT_EPTP_PENDING_EVENT 0xffffffffU /* suberror: no VM entry */
 #define KVM_HBT_EPTP_LIVE_CONFIG 4
 #define KVM_HBT_EPTP_READ_MAPS 5
+#define KVM_HBT_EPTP_MAP_DATA 6 /* nr_pages is the guest RAM page number */
 #define KVM_HBT_EPTP_MAX_PAGES 512
 #define KVM_HBT_EPTP_MAX_OVERLAYS 16
 #define KVM_HBT_EPTP_UNDER_HYPERVISOR 1 /* QUERY output; timing is not L0 evidence */
 #define KVM_HBT_EPTP_SHARED_OVERLAY 2 /* QUERY: identical image pointers share backing */
+#define KVM_HBT_EPTP_LAZY_DATA 4 /* QUERY: MAP_DATA and exit data[6] GPA */
 #define KVM_EXIT_HBT_EPTP 0x48425402
 
 struct kvm_hbt_eptp_overlay {
@@ -192,6 +195,11 @@ struct kvm_hbt_eptp_overlay {
  * Extra GPAs below 1 GiB are allowed only with private images. READ_MAPS
  * uses an array of kvm_hbt_eptp_overlay as page/destination pairs, nr_pages
  * and image_addr zero, and view 0/1. This remains an opt-in laboratory ABI.
+ * MAP_DATA adds one ordinary RAM page to both views as read/write, never
+ * executable. nr_pages is its GPA page index inside the original LIVE_CONFIG
+ * RAM range; all other request inputs are zero. Explicit overlays cannot be
+ * upgraded. Up to 256 additional pages are pinned until DESTROY; writes are
+ * conservatively marked dirty in the canonical KVM memory slot.
  */
 struct kvm_hbt_eptp_live_map {
 	__u32 page;
