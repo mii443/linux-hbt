@@ -154,7 +154,7 @@ struct kvm_hbt_xstate {
 
 /*
  * Bounded VMX laboratory interface, NOT a migratable RAM/translation API.
- * CONFIG copies nr_pages of RAM at GPA 0 and up to 16 private helper pages.
+ * CONFIG copies nr_pages of RAM at GPA 0 and up to MAX_OVERLAYS private helper pages.
  * Other pages are shared by the two EPT views. READ copies one complete view.
  * Every hardware exit is returned without guest instruction emulation:
  * run->internal.suberror = raw VMX exit reason; data[0..4] = view,
@@ -173,11 +173,14 @@ struct kvm_hbt_xstate {
 #define KVM_HBT_EPTP_LIVE_CONFIG 4
 #define KVM_HBT_EPTP_READ_MAPS 5
 #define KVM_HBT_EPTP_MAP_DATA 6 /* nr_pages is the guest RAM page number */
+#define KVM_HBT_EPTP_SUSPEND 7 /* retain an inactive live context */
+#define KVM_HBT_EPTP_RESUME 8 /* refresh its private images, enter normal view */
 #define KVM_HBT_EPTP_MAX_PAGES 512
-#define KVM_HBT_EPTP_MAX_OVERLAYS 16
+#define KVM_HBT_EPTP_MAX_OVERLAYS 256
 #define KVM_HBT_EPTP_UNDER_HYPERVISOR 1 /* QUERY output; timing is not L0 evidence */
 #define KVM_HBT_EPTP_SHARED_OVERLAY 2 /* QUERY: identical image pointers share backing */
 #define KVM_HBT_EPTP_LAZY_DATA 4 /* QUERY: MAP_DATA and exit data[6] GPA */
+#define KVM_HBT_EPTP_PERSISTENT 8 /* QUERY: SUSPEND/RESUME and larger map budget */
 #define KVM_EXIT_HBT_EPTP 0x48425402
 
 struct kvm_hbt_eptp_overlay {
@@ -188,7 +191,7 @@ struct kvm_hbt_eptp_overlay {
 
 /* LIVE_CONFIG bounds user RAM at GPA 0 by nr_pages (at most 1 GiB).
  * Only explicitly listed RAM pages are pinned; all other GPAs are unmapped.
- * Up to 16 mappings select pages: permissions bits 2:0 are N R/W/X, bits 10:8 H.
+ * Up to MAX_OVERLAYS mappings: permissions bits 2:0 are N R/W/X, bits 10:8 H.
  * A zero image pointer selects pinned RAM; nonzero copies a private page.
  * With SHARED_OVERLAY, repeated nonzero pointers alias the same private copy
  * across maps/views. Each EPT leaf retains its own access permissions.
@@ -200,6 +203,13 @@ struct kvm_hbt_eptp_overlay {
  * RAM range; all other request inputs are zero. Explicit overlays cannot be
  * upgraded. Up to 256 additional pages are pinned until DESTROY; writes are
  * conservatively marked dirty in the canonical KVM memory slot.
+ * SUSPEND removes the private views from execution without freeing them.
+ * RESUME recopies writable private images from the original LIVE_CONFIG user pointers;
+ * Read/execute-only images remain immutable until the next LIVE_CONFIG;
+ * the VMM must first validate code/page tables and refresh architectural state.
+ * Both take zero arguments beyond version/operation. A failed refresh stays
+ * suspended. Successful LIVE_CONFIG replaces any suspended context; DESTROY
+ * frees both active and suspended contexts. No cache contents are VM state.
  */
 struct kvm_hbt_eptp_live_map {
 	__u32 page;

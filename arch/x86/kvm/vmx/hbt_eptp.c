@@ -77,6 +77,8 @@ void vmx_hbt_eptp_free(struct vcpu_vmx *vmx)
 {
 	free_probe(vmx->hbt_eptp);
 	vmx->hbt_eptp = NULL;
+	free_probe(vmx->hbt_eptp_cache);
+	vmx->hbt_eptp_cache = NULL;
 }
 
 static void *copy_page_from_user(u64 address)
@@ -94,7 +96,7 @@ static void *copy_page_from_user(u64 address)
 
 static int configure_probe(struct vcpu_vmx *vmx, struct kvm_hbt_eptp_probe *req)
 {
-	struct kvm_hbt_eptp_overlay overlays[KVM_HBT_EPTP_MAX_OVERLAYS];
+	struct kvm_hbt_eptp_overlay *overlays __free(kfree) = NULL;
 	struct vmx_hbt_eptp *p;
 	unsigned int i, v, l;
 	void *page;
@@ -106,6 +108,9 @@ static int configure_probe(struct vcpu_vmx *vmx, struct kvm_hbt_eptp_probe *req)
 		return -EINVAL;
 	if (vmx->hbt_eptp)
 		return -EBUSY;
+	overlays = kmalloc_array(req->nr_overlays, sizeof(*overlays), GFP_KERNEL_ACCOUNT);
+	if (!overlays)
+		return -ENOMEM;
 	if (copy_from_user(overlays, u64_to_user_ptr(req->overlays_addr),
 			   req->nr_overlays * sizeof(overlays[0])))
 		return -EFAULT;
@@ -200,7 +205,7 @@ static int configure_live(struct vcpu_vmx *vmx, struct kvm_hbt_eptp_probe *req)
 {
 	struct vmx_hbt_eptp *p;
 	unsigned int i, j, v, l;
-	u64 ram_leaves[KVM_HBT_EPTP_MAX_OVERLAYS] = {};
+	u64 *ram_leaves __free(kfree) = NULL;
 	long pinned;
 	int ret = -ENOMEM;
 
@@ -219,6 +224,9 @@ static int configure_live(struct vcpu_vmx *vmx, struct kvm_hbt_eptp_probe *req)
 	p = kzalloc_obj(*p, GFP_KERNEL_ACCOUNT);
 	if (!p)
 		return -ENOMEM;
+	ram_leaves = kcalloc(req->nr_overlays, sizeof(*ram_leaves), GFP_KERNEL_ACCOUNT);
+	if (!ram_leaves)
+		goto fail;
 	p->live = true;
 	p->ram_hva = req->image_addr;
 	p->ram_pages = req->nr_pages;
@@ -311,6 +319,8 @@ static int configure_live(struct vcpu_vmx *vmx, struct kvm_hbt_eptp_probe *req)
 				goto fail;
 		}
 	}
+	free_probe(vmx->hbt_eptp_cache);
+	vmx->hbt_eptp_cache = NULL;
 	vmx->hbt_eptp = p;
 	return 0;
 fail:
@@ -360,7 +370,7 @@ static int map_live_data(struct kvm_vcpu *vcpu, struct vmx_hbt_eptp *p,
 
 static int read_maps(struct vmx_hbt_eptp *p, struct kvm_hbt_eptp_probe *req)
 {
-	struct kvm_hbt_eptp_overlay maps[KVM_HBT_EPTP_MAX_OVERLAYS];
+	struct kvm_hbt_eptp_overlay *maps __free(kfree) = NULL;
 	unsigned int i, j;
 
 	if (!p || !p->live)
@@ -368,6 +378,9 @@ static int read_maps(struct vmx_hbt_eptp *p, struct kvm_hbt_eptp_probe *req)
 	if (req->view > 1 || req->nr_pages || req->image_addr ||
 	    req->nr_overlays > KVM_HBT_EPTP_MAX_OVERLAYS)
 		return -EINVAL;
+	maps = kmalloc_array(req->nr_overlays, sizeof(*maps), GFP_KERNEL_ACCOUNT);
+	if (!maps)
+		return -ENOMEM;
 	if (copy_from_user(maps, u64_to_user_ptr(req->overlays_addr),
 			   req->nr_overlays * sizeof(maps[0])))
 		return -EFAULT;
@@ -384,6 +397,62 @@ static int read_maps(struct vmx_hbt_eptp *p, struct kvm_hbt_eptp_probe *req)
 		if (copy_to_user(u64_to_user_ptr(maps[i].image_addr), page, PAGE_SIZE))
 			return -EFAULT;
 	}
+	return 0;
+}
+
+/* The inactive object is deliberately absent from all VM-entry hooks. Guest
+ * events and normal KVM execution therefore cannot see helper mappings/state.
+ * Refresh failures leave it inactive, including a partially copied image.
+ */
+static int resume_live(struct vcpu_vmx *vmx)
+{
+	struct vmx_hbt_eptp *p = vmx->hbt_eptp_cache;
+	unsigned int v, i;
+
+	if (vmx->hbt_eptp)
+		return -EBUSY;
+	if (!p)
+		return -ENOENT;
+	for (v = 0; v < 2; v++) {
+		for (i = 0; i < p->map_count; i++) {
+			u64 address = v ? p->maps[i].helper_addr : p->maps[i].normal_addr;
+			unsigned int perm = (p->maps[i].permissions >> (v * 8)) & 7;
+			bool copied = false;
+			unsigned int pv, pi;
+
+			/* Read/execute-only images are immutable until LIVE_CONFIG.
+			 * Writable aliases share both backing and source; refresh once.
+			 */
+			if (!p->map_pages[v][i] || !(perm & 2))
+				continue;
+			for (pv = 0; pv <= v && !copied; pv++) {
+				for (pi = 0; pi < (pv == v ? i : p->map_count); pi++) {
+					if (p->map_pages[pv][pi] == p->map_pages[v][i] &&
+					    ((p->maps[pi].permissions >> (pv * 8)) & 2)) {
+						copied = true;
+						break;
+					}
+				}
+			}
+			if (!copied && copy_from_user(p->map_pages[v][i],
+						u64_to_user_ptr(address), PAGE_SIZE))
+				return -EFAULT;
+		}
+	}
+	p->view = 0;
+	p->entered = false;
+	p->pending_event = false;
+	p->must_recover = false;
+	/* A canonical dirty-log collection may have cleared the first MAP_DATA
+	 * marks while this context was parked. Retained writable leaves bypass
+	 * the ordinary MMU, so conservatively mark them again on reactivation.
+	 */
+	kvm_vcpu_srcu_read_lock(&vmx->vcpu);
+	for (i = 0; i < p->data_count; i++)
+		kvm_vcpu_mark_page_dirty(&vmx->vcpu, p->data_pages[i]);
+	kvm_vcpu_srcu_read_unlock(&vmx->vcpu);
+	vmx->hbt_eptp_cache = NULL;
+	vmx->hbt_eptp = p;
 	return 0;
 }
 
@@ -417,7 +486,8 @@ long vmx_hbt_eptp_probe(struct kvm_vcpu *vcpu, void __user *argp)
 		req.nr_overlays = KVM_HBT_EPTP_MAX_OVERLAYS;
 		req.view = p ? p->view : 0;
 		req.flags = boot_cpu_has(X86_FEATURE_HYPERVISOR) ? KVM_HBT_EPTP_UNDER_HYPERVISOR : 0;
-		req.flags |= KVM_HBT_EPTP_SHARED_OVERLAY | KVM_HBT_EPTP_LAZY_DATA;
+		req.flags |= KVM_HBT_EPTP_SHARED_OVERLAY | KVM_HBT_EPTP_LAZY_DATA |
+			     KVM_HBT_EPTP_PERSISTENT;
 		return copy_to_user(argp, &req, sizeof(req)) ? -EFAULT : 0;
 	case KVM_HBT_EPTP_CONFIG:
 		return configure_probe(vmx, &req);
@@ -442,6 +512,21 @@ long vmx_hbt_eptp_probe(struct kvm_vcpu *vcpu, void __user *argp)
 				return -EFAULT;
 		}
 		return 0;
+	case KVM_HBT_EPTP_SUSPEND:
+		if (req.nr_pages || req.view || req.image_addr ||
+		    req.overlays_addr || req.nr_overlays)
+			return -EINVAL;
+		if (!p || !p->live || p->entered || p->deferred_irq)
+			return -EBUSY;
+		free_probe(vmx->hbt_eptp_cache);
+		vmx->hbt_eptp_cache = p;
+		vmx->hbt_eptp = NULL;
+		return 0;
+	case KVM_HBT_EPTP_RESUME:
+		if (req.nr_pages || req.view || req.image_addr ||
+		    req.overlays_addr || req.nr_overlays)
+			return -EINVAL;
+		return resume_live(vmx);
 	case KVM_HBT_EPTP_DESTROY:
 		if (req.nr_pages || req.view || req.image_addr || req.overlays_addr || req.nr_overlays)
 			return -EINVAL;
