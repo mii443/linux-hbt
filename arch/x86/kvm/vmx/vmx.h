@@ -202,6 +202,8 @@ struct vcpu_vmx {
 	struct vcpu_vt	      vt;
 	struct vmx_hbt_eptp   *hbt_eptp;
 	struct vmx_hbt_eptp   *hbt_eptp_cache;
+	struct vmx_hbt_eptp   *hbt_eptp_contexts[KVM_HBT_EPTP_MAX_CONTEXTS];
+	u64                   hbt_eptp_age;
 	u8                    fail;
 	u8		      x2apic_msr_bitmap_mode;
 

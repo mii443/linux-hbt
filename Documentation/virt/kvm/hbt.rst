@@ -375,6 +375,30 @@ selected private pages back to userspace using page/destination pairs in the
 old overlay structure. It requires zero ``nr_pages``/``image_addr`` and view
 0 or 1. READ of a live configuration is rejected.
 
+QUERY advertises PERSISTENT for SUSPEND/RESUME. SUSPEND removes the active
+context from all VM-entry hooks while retaining its EPTs, private images and
+lazy data pins. RESUME refreshes each unique writable image, leaves immutable
+images unchanged, marks retained writable data dirty again, and restarts in
+normal view. The VMM must validate canonical code/PTEs and import current
+architectural state first. A failed refresh leaves the context inactive.
+
+CONTEXT_CACHE adds CACHE_CONFIG, CACHE_RESUME and CACHE_DROP. These operations
+take a nonzero caller key in ``reserved[0]``; other reserved fields remain zero.
+CACHE_CONFIG otherwise takes LIVE_CONFIG arguments and replaces the same
+inactive key only after successful construction. SUSPEND retains up to 64
+keyed contexts in an LRU cache, separate from the legacy unkeyed slot and
+the active view. QUERY reports this limit in output ``reserved[0]`` (its input
+must be zero). Each retained context keeps the existing per-context overlay
+and pin bounds. A VMM should use bounded keys and discard obsolete contexts.
+
+CACHE_RESUME takes only the key and may return ENOENT after LRU eviction.
+Successful resume preserves the selected context's data pins; other contexts
+remain inactive. Failed refresh is retryable and does not affect other keys.
+CACHE_DROP releases one inactive key and rejects its active counterpart.
+DESTROY and vCPU teardown release every active, keyed and legacy context.
+No cached view is guest state or migration data. All image pointers used for
+refresh must remain valid; immutable changes require a new configuration.
+
 Both EPTs and the VMFUNC list are owned by the kernel. Original RAM references
 are obtained with GUP, never supplied as host physical addresses. A failed
 configuration releases every acquired pin and allocation. Teardown marks

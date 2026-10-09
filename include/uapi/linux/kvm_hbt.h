@@ -175,12 +175,17 @@ struct kvm_hbt_xstate {
 #define KVM_HBT_EPTP_MAP_DATA 6 /* nr_pages is the guest RAM page number */
 #define KVM_HBT_EPTP_SUSPEND 7 /* retain an inactive live context */
 #define KVM_HBT_EPTP_RESUME 8 /* refresh its private images, enter normal view */
+#define KVM_HBT_EPTP_CACHE_CONFIG 9 /* LIVE_CONFIG with nonzero reserved[0] key */
+#define KVM_HBT_EPTP_CACHE_RESUME 10 /* resume the suspended reserved[0] key */
+#define KVM_HBT_EPTP_CACHE_DROP 11 /* discard an inactive reserved[0] key */
+#define KVM_HBT_EPTP_MAX_CONTEXTS 64
 #define KVM_HBT_EPTP_MAX_PAGES 512
 #define KVM_HBT_EPTP_MAX_OVERLAYS 256
 #define KVM_HBT_EPTP_UNDER_HYPERVISOR 1 /* QUERY output; timing is not L0 evidence */
 #define KVM_HBT_EPTP_SHARED_OVERLAY 2 /* QUERY: identical image pointers share backing */
 #define KVM_HBT_EPTP_LAZY_DATA 4 /* QUERY: MAP_DATA and exit data[6] GPA */
 #define KVM_HBT_EPTP_PERSISTENT 8 /* QUERY: SUSPEND/RESUME and larger map budget */
+#define KVM_HBT_EPTP_CONTEXT_CACHE 16 /* QUERY: keyed operations; reserved[0] limit */
 #define KVM_EXIT_HBT_EPTP 0x48425402
 
 struct kvm_hbt_eptp_overlay {
@@ -210,6 +215,13 @@ struct kvm_hbt_eptp_overlay {
  * Both take zero arguments beyond version/operation. A failed refresh stays
  * suspended. Successful LIVE_CONFIG replaces any suspended context; DESTROY
  * frees both active and suspended contexts. No cache contents are VM state.
+ * CONTEXT_CACHE additionally supports nonzero caller keys in reserved[0] for
+ * CACHE_CONFIG/RESUME/DROP. Other reserved fields remain zero. CACHE_CONFIG
+ * replaces the same inactive key only after successful construction. SUSPEND
+ * parks keyed contexts in a bounded LRU; CACHE_RESUME may return ENOENT after
+ * eviction. Failed refresh leaves the selected context inactive and retryable.
+ * CACHE_DROP rejects active keys; DESTROY releases all keyed and legacy views.
+ * QUERY reports MAX_CONTEXTS in reserved[0] (input must still be zero).
  */
 struct kvm_hbt_eptp_live_map {
 	__u32 page;

@@ -26,6 +26,7 @@ module_param(hbt_eptp_probe, bool, 0444);
 MODULE_PARM_DESC(hbt_eptp_probe, "Enable the bounded HBT VMFUNC test interface");
 
 struct vmx_hbt_eptp {
+	u64 key, age;
 	u64 *list;
 	u64 *tables[2][4];
 	void *ram[KVM_HBT_EPTP_MAX_PAGES];
@@ -75,10 +76,46 @@ static void free_probe(struct vmx_hbt_eptp *p)
 
 void vmx_hbt_eptp_free(struct vcpu_vmx *vmx)
 {
+	unsigned int i;
+
 	free_probe(vmx->hbt_eptp);
 	vmx->hbt_eptp = NULL;
 	free_probe(vmx->hbt_eptp_cache);
 	vmx->hbt_eptp_cache = NULL;
+	for (i = 0; i < KVM_HBT_EPTP_MAX_CONTEXTS; i++) {
+		free_probe(vmx->hbt_eptp_contexts[i]);
+		vmx->hbt_eptp_contexts[i] = NULL;
+	}
+}
+
+static struct vmx_hbt_eptp **cached_context(struct vcpu_vmx *vmx, u64 key)
+{
+	unsigned int i;
+
+	for (i = 0; i < KVM_HBT_EPTP_MAX_CONTEXTS; i++)
+		if (vmx->hbt_eptp_contexts[i] && vmx->hbt_eptp_contexts[i]->key == key)
+			return &vmx->hbt_eptp_contexts[i];
+	return NULL;
+}
+
+static void park_context(struct vcpu_vmx *vmx, struct vmx_hbt_eptp *p)
+{
+	struct vmx_hbt_eptp **slot = &vmx->hbt_eptp_contexts[0];
+	unsigned int i;
+
+	for (i = 0; i < KVM_HBT_EPTP_MAX_CONTEXTS; i++) {
+		struct vmx_hbt_eptp **candidate = &vmx->hbt_eptp_contexts[i];
+
+		if (!*candidate) {
+			slot = candidate;
+			break;
+		}
+		if ((*candidate)->age < (*slot)->age)
+			slot = candidate;
+	}
+	free_probe(*slot);
+	p->age = ++vmx->hbt_eptp_age;
+	*slot = p;
 }
 
 static void *copy_page_from_user(u64 address)
@@ -204,6 +241,7 @@ static void *live_overlay_copy(struct vmx_hbt_eptp *p, unsigned int view,
 static int configure_live(struct vcpu_vmx *vmx, struct kvm_hbt_eptp_probe *req)
 {
 	struct vmx_hbt_eptp *p;
+	struct vmx_hbt_eptp **old;
 	unsigned int i, j, v, l;
 	u64 *ram_leaves __free(kfree) = NULL;
 	long pinned;
@@ -228,6 +266,7 @@ static int configure_live(struct vcpu_vmx *vmx, struct kvm_hbt_eptp_probe *req)
 	if (!ram_leaves)
 		goto fail;
 	p->live = true;
+	p->key = req->reserved[0];
 	p->ram_hva = req->image_addr;
 	p->ram_pages = req->nr_pages;
 	p->map_count = req->nr_overlays;
@@ -319,8 +358,11 @@ static int configure_live(struct vcpu_vmx *vmx, struct kvm_hbt_eptp_probe *req)
 				goto fail;
 		}
 	}
-	free_probe(vmx->hbt_eptp_cache);
-	vmx->hbt_eptp_cache = NULL;
+	old = p->key ? cached_context(vmx, p->key) : &vmx->hbt_eptp_cache;
+	if (old) {
+		free_probe(*old);
+		*old = NULL;
+	}
 	vmx->hbt_eptp = p;
 	return 0;
 fail:
@@ -404,9 +446,9 @@ static int read_maps(struct vmx_hbt_eptp *p, struct kvm_hbt_eptp_probe *req)
  * events and normal KVM execution therefore cannot see helper mappings/state.
  * Refresh failures leave it inactive, including a partially copied image.
  */
-static int resume_live(struct vcpu_vmx *vmx)
+static int resume_live(struct vcpu_vmx *vmx, struct vmx_hbt_eptp **slot)
 {
-	struct vmx_hbt_eptp *p = vmx->hbt_eptp_cache;
+	struct vmx_hbt_eptp *p = slot ? *slot : NULL;
 	unsigned int v, i;
 
 	if (vmx->hbt_eptp)
@@ -451,7 +493,7 @@ static int resume_live(struct vcpu_vmx *vmx)
 	for (i = 0; i < p->data_count; i++)
 		kvm_vcpu_mark_page_dirty(&vmx->vcpu, p->data_pages[i]);
 	kvm_vcpu_srcu_read_unlock(&vmx->vcpu);
-	vmx->hbt_eptp_cache = NULL;
+	*slot = NULL;
 	vmx->hbt_eptp = p;
 	return 0;
 }
@@ -461,6 +503,7 @@ long vmx_hbt_eptp_probe(struct kvm_vcpu *vcpu, void __user *argp)
 	struct kvm_hbt_eptp_probe req;
 	struct vcpu_vmx *vmx;
 	struct vmx_hbt_eptp *p;
+	struct vmx_hbt_eptp **slot;
 	u64 funcs;
 	unsigned int i;
 
@@ -471,7 +514,10 @@ long vmx_hbt_eptp_probe(struct kvm_vcpu *vcpu, void __user *argp)
 	if (copy_from_user(&req, argp, sizeof(req)))
 		return -EFAULT;
 	if (req.version != KVM_HBT_EPTP_VERSION || req.flags ||
-	    memchr_inv(req.reserved, 0, sizeof(req.reserved)))
+	    req.reserved[1] || req.reserved[2])
+		return -EINVAL;
+	if (req.operation >= KVM_HBT_EPTP_CACHE_CONFIG &&
+	    req.operation <= KVM_HBT_EPTP_CACHE_DROP ? !req.reserved[0] : req.reserved[0])
 		return -EINVAL;
 	vmx = to_vmx(vcpu);
 	p = vmx->hbt_eptp;
@@ -487,11 +533,13 @@ long vmx_hbt_eptp_probe(struct kvm_vcpu *vcpu, void __user *argp)
 		req.view = p ? p->view : 0;
 		req.flags = boot_cpu_has(X86_FEATURE_HYPERVISOR) ? KVM_HBT_EPTP_UNDER_HYPERVISOR : 0;
 		req.flags |= KVM_HBT_EPTP_SHARED_OVERLAY | KVM_HBT_EPTP_LAZY_DATA |
-			     KVM_HBT_EPTP_PERSISTENT;
+			     KVM_HBT_EPTP_PERSISTENT | KVM_HBT_EPTP_CONTEXT_CACHE;
+		req.reserved[0] = KVM_HBT_EPTP_MAX_CONTEXTS;
 		return copy_to_user(argp, &req, sizeof(req)) ? -EFAULT : 0;
 	case KVM_HBT_EPTP_CONFIG:
 		return configure_probe(vmx, &req);
 	case KVM_HBT_EPTP_LIVE_CONFIG:
+	case KVM_HBT_EPTP_CACHE_CONFIG:
 		return configure_live(vmx, &req);
 	case KVM_HBT_EPTP_MAP_DATA:
 		return map_live_data(vcpu, p, &req);
@@ -518,15 +566,31 @@ long vmx_hbt_eptp_probe(struct kvm_vcpu *vcpu, void __user *argp)
 			return -EINVAL;
 		if (!p || !p->live || p->entered || p->deferred_irq)
 			return -EBUSY;
-		free_probe(vmx->hbt_eptp_cache);
-		vmx->hbt_eptp_cache = p;
+		if (p->key) {
+			park_context(vmx, p);
+		} else {
+			free_probe(vmx->hbt_eptp_cache);
+			vmx->hbt_eptp_cache = p;
+		}
 		vmx->hbt_eptp = NULL;
 		return 0;
 	case KVM_HBT_EPTP_RESUME:
+	case KVM_HBT_EPTP_CACHE_RESUME:
+	case KVM_HBT_EPTP_CACHE_DROP:
 		if (req.nr_pages || req.view || req.image_addr ||
 		    req.overlays_addr || req.nr_overlays)
 			return -EINVAL;
-		return resume_live(vmx);
+		slot = req.reserved[0] ? cached_context(vmx, req.reserved[0]) :
+			&vmx->hbt_eptp_cache;
+		if (req.operation != KVM_HBT_EPTP_CACHE_DROP)
+			return resume_live(vmx, slot);
+		if (p && p->key == req.reserved[0])
+			return -EBUSY;
+		if (!slot || !*slot)
+			return -ENOENT;
+		free_probe(*slot);
+		*slot = NULL;
+		return 0;
 	case KVM_HBT_EPTP_DESTROY:
 		if (req.nr_pages || req.view || req.image_addr || req.overlays_addr || req.nr_overlays)
 			return -EINVAL;
