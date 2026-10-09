@@ -384,8 +384,8 @@ struct x86_emulate_ctxt {
 
 	/* Opt-in software vector decoding; never used by ordinary KVM guests. */
 	struct {
-		u8 op, bytes, src1, reg_hi, rm_hi, mask;
-		bool evex, zero, broadcast;
+		u8 op, bytes, element_bytes, input_bytes, src1, reg_hi, rm_hi, mask;
+		bool evex, zero, broadcast, gpr, aligned;
 	} hbt_vector;
 	u8 disp8_scale;
 	bool rip_relative;

@@ -5,6 +5,7 @@
 #include <linux/uaccess.h>
 
 #include "x86.h"
+#include "cpuid.h"
 #include "hbt.h"
 #include "mmu.h"
 
@@ -73,6 +74,34 @@ void kvm_hbt_reset(struct kvm_vcpu *vcpu)
 	/* Do not reuse request IDs across RESET/INIT. */
 }
 
+/* Avoid sending unrelated #UDs to the bounded direct SSE compiler. This is
+ * only a dispatch filter: userspace validates operands and patch placement.
+ */
+static bool hbt_eptp_candidate(const u8 *p, unsigned int n)
+{
+	unsigned int map, pp, op;
+
+	if (n >= 6 && p[0] == 0x62)
+		return (p[1] & 0x5f) == 0x51 && (p[2] & 0x87) == 5 &&
+		       (p[3] & 0x9f) == 8 && (p[3] & 0x60) != 0x60 &&
+		       (p[4] == 0xef || p[4] == 0xfe) && (p[5] & 0xc0) == 0xc0;
+	if (n >= 4 && p[0] == 0xc5) {
+		map = 1; pp = p[1] & 3; op = p[2];
+	} else if (n >= 5 && p[0] == 0xc4) {
+		map = p[1] & 0x1f; pp = p[2] & 3; op = p[3];
+	} else {
+		return false;
+	}
+	if (map == 3 && pp == 1)
+		return op == 0x18 || op == 0x38 || op == 0x22;
+	if (map != 1)
+		return false;
+	return op == 0x10 || op == 0x28 || op == 0x2a ||
+	       (op >= 0x54 && op <= 0x59) || op == 0x5c || op == 0x5e ||
+	       op == 0x6c || op == 0x6e || op == 0x6f || op == 0x7e ||
+	       op == 0xd4 || op == 0xef || op == 0xfc || op == 0xfd || op == 0xfe;
+}
+
 bool kvm_hbt_prepare_ud(struct kvm_vcpu *vcpu)
 {
 	struct x86_exception exception = {};
@@ -97,6 +126,25 @@ bool kvm_hbt_prepare_ud(struct kvm_vcpu *vcpu)
 	gpa = kvm_mmu_gva_to_gpa_fetch(vcpu, linear, &exception);
 	if (gpa == INVALID_GPA)
 		return false;
+	if (vcpu->kvm->arch.hbt_virtual_xstate_enabled) {
+		struct kvm_cpuid_entry2 *entry;
+		u8 prefix[6];
+		unsigned int n = min_t(unsigned int, sizeof(prefix),
+					PAGE_SIZE - offset_in_page(linear));
+
+		if (mode != 64 || !(kvm_read_cr4(vcpu) & X86_CR4_OSXSAVE) ||
+		    (kvm_read_cr0(vcpu) & (X86_CR0_EM | X86_CR0_TS)) ||
+		    (vcpu->arch.xcr0 & 6) != 6 ||
+		    kvm_vcpu_read_xom_guest(vcpu, gpa, prefix, n) ||
+		    !hbt_eptp_candidate(prefix, n))
+			return false;
+		entry = kvm_find_cpuid_entry_index(vcpu, 7, 0);
+		if (prefix[0] == 0x62 &&
+		    ((vcpu->arch.xcr0 & 0xe6) != 0xe6 ||
+		     ((prefix[3] & 0x60) != 0x40 &&
+		      (!entry || !cpuid_entry_has(entry, X86_FEATURE_AVX512VL)))))
+			return false;
+	}
 	state = kzalloc_obj(*state, GFP_KERNEL_ACCOUNT);
 	if (!state)
 		return false;

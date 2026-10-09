@@ -3857,8 +3857,86 @@ static int hbt_xstate_write(void *opaque, u32 offset, const void *data, u32 size
 
 enum hbt_vector_op {
 	HBT_VECTOR_XOR = 1, HBT_VECTOR_ADD, HBT_VECTOR_BROADCAST,
-	HBT_VECTOR_LOAD, HBT_VECTOR_STORE,
+	HBT_VECTOR_LOAD, HBT_VECTOR_STORE, HBT_VECTOR_GPR_LOAD,
+	HBT_VECTOR_GPR_STORE, HBT_VECTOR_SCALAR_LOAD, HBT_VECTOR_SCALAR_STORE,
+	HBT_VECTOR_LOGIC, HBT_VECTOR_FLOAT, HBT_VECTOR_FMA, HBT_VECTOR_ZERO,
+	HBT_VECTOR_INT_FLOAT, HBT_VECTOR_INSERT, HBT_VECTOR_QUAD_LOAD,
+	HBT_VECTOR_QUAD_STORE, HBT_VECTOR_INSERT128,
 };
+
+/* Use the guest's live MXCSR, including rounding, DAZ/FTZ and exception masks.
+ * Recover host #XM through the exception table, restore every scratch register,
+ * then inject the guest fault without committing its destination. This avoids
+ * synthesizing exception priorities from a computation with all masks set.
+ * All operands are kernel buffers; no guest-memory access holds fpregs_lock.
+ */
+static int hbt_scalar_float(struct x86_emulate_ctxt *ctxt, const u32 left[16],
+			    const u32 right[16], u32 result[16])
+{
+	avx256_t saved0, saved1;
+	bool fma = ctxt->hbt_vector.op == HBT_VECTOR_FMA;
+	bool dbl = ctxt->hbt_vector.element_bytes == 8;
+	int rc = X86EMUL_CONTINUE;
+
+	if (fma && !boot_cpu_has(X86_FEATURE_FMA))
+		return X86EMUL_UNHANDLEABLE;
+	kvm_fpu_get();
+	_kvm_read_avx_reg(0, &saved0);
+	if (fma) {
+		_kvm_read_avx_reg(1, &saved1);
+		_kvm_write_sse_reg(0, (const sse128_t *)result);
+		_kvm_write_sse_reg(1, (const sse128_t *)left);
+	} else {
+		_kvm_write_sse_reg(0, (const sse128_t *)left);
+	}
+#define HBT_FP(insn) asm_safe(insn " %[src], %%xmm0", \
+	: [src] "m" (*(const u64 *)right) : "memory")
+#define HBT_FMA(insn) asm_safe(insn " %[src], %%xmm1, %%xmm0", \
+	: [src] "m" (*(const u64 *)right) : "memory")
+	switch (ctxt->b) {
+	case 0x2a:
+#ifdef CONFIG_X86_64
+		if (ctxt->hbt_vector.input_bytes == 8)
+			rc = dbl ? HBT_FP("cvtsi2sdq") : HBT_FP("cvtsi2ssq");
+		else
+#endif
+			rc = dbl ? HBT_FP("cvtsi2sdl") : HBT_FP("cvtsi2ssl");
+		break;
+	case 0x58:
+		rc = dbl ? HBT_FP("addsd") : HBT_FP("addss");
+		break;
+	case 0x59:
+		rc = dbl ? HBT_FP("mulsd") : HBT_FP("mulss");
+		break;
+	case 0x5c:
+		rc = dbl ? HBT_FP("subsd") : HBT_FP("subss");
+		break;
+	case 0x5e:
+		rc = dbl ? HBT_FP("divsd") : HBT_FP("divss");
+		break;
+	case 0x99:
+		rc = dbl ? HBT_FMA("vfmadd132sd") : HBT_FMA("vfmadd132ss");
+		break;
+	case 0xa9:
+		rc = dbl ? HBT_FMA("vfmadd213sd") : HBT_FMA("vfmadd213ss");
+		break;
+	case 0xb9:
+		rc = dbl ? HBT_FMA("vfmadd231sd") : HBT_FMA("vfmadd231ss");
+		break;
+	}
+#undef HBT_FP
+#undef HBT_FMA
+	if (rc == X86EMUL_CONTINUE)
+		_kvm_read_sse_reg(0, (sse128_t *)result);
+	_kvm_write_avx_reg(0, &saved0);
+	if (fma)
+		_kvm_write_avx_reg(1, &saved1);
+	kvm_fpu_put();
+	if (rc != X86EMUL_CONTINUE)
+		return ctxt->ops->get_cr(ctxt, 4) & X86_CR4_OSXMMEXCPT ?
+			emulate_exception(ctxt, XM_VECTOR, 0, false) : emulate_ud(ctxt);
+	return X86EMUL_CONTINUE;
+}
 
 static int em_hbt_vector(struct x86_emulate_ctxt *ctxt)
 {
@@ -3867,13 +3945,22 @@ static int em_hbt_vector(struct x86_emulate_ctxt *ctxt)
 		.ctxt = ctxt, .rc = X86EMUL_CONTINUE,
 	};
 	unsigned int op = ctxt->hbt_vector.op, bytes = ctxt->hbt_vector.bytes;
+	unsigned int elem = ctxt->hbt_vector.element_bytes, lanes = bytes / elem;
 	unsigned int reg = ctxt->modrm_reg | ctxt->hbt_vector.reg_hi;
 	unsigned int rm = ctxt->modrm_rm | ctxt->hbt_vector.rm_hi;
 	unsigned int src1 = ctxt->hbt_vector.src1, i;
-	bool memory = ctxt->modrm_mod != 3, store = op == HBT_VECTOR_STORE;
+	bool memory = ctxt->modrm_mod != 3;
+	bool merge = op == HBT_VECTOR_SCALAR_LOAD || op == HBT_VECTOR_SCALAR_STORE;
+	bool scalar = merge || op == HBT_VECTOR_QUAD_LOAD || op == HBT_VECTOR_QUAD_STORE;
+	bool gpr_move = op == HBT_VECTOR_GPR_LOAD || op == HBT_VECTOR_GPR_STORE;
+	bool store = op == HBT_VECTOR_STORE || op == HBT_VECTOR_GPR_STORE ||
+		     op == HBT_VECTOR_SCALAR_STORE || op == HBT_VECTOR_QUAD_STORE;
+	bool fp = op == HBT_VECTOR_FLOAT || op == HBT_VECTOR_FMA || op == HBT_VECTOR_INT_FLOAT;
+	unsigned int input = op == HBT_VECTOR_INT_FLOAT ? ctxt->hbt_vector.input_bytes : elem;
 	u32 eax = 1, ebx, ecx = 0, edx;
-	u64 xcr0, mask = (1U << (bytes / 4)) - 1;
+	u64 xcr0, mask = lanes == 64 ? U64_MAX : BIT_ULL(lanes) - 1;
 	unsigned long cr0 = ctxt->ops->get_cr(ctxt, 0);
+	int rc;
 
 	if ((ctxt->mode != X86EMUL_MODE_PROT32 && ctxt->mode != X86EMUL_MODE_PROT64) ||
 	    (ctxt->mode != X86EMUL_MODE_PROT64 &&
@@ -3881,66 +3968,199 @@ static int em_hbt_vector(struct x86_emulate_ctxt *ctxt)
 	    (ctxt->hbt_vector.zero && (!ctxt->hbt_vector.mask || (store && memory))) ||
 	    (ctxt->hbt_vector.broadcast &&
 	     (!memory || (op != HBT_VECTOR_XOR && op != HBT_VECTOR_ADD))) ||
+	    (ctxt->hbt_vector.gpr && (memory || rm >= 16 ||
+				    (elem == 8 && ctxt->mode != X86EMUL_MODE_PROT64))) ||
+	    (gpr_move && (ctxt->hbt_vector.mask || ctxt->hbt_vector.zero ||
+			 (!memory && rm >= 16))) ||
+	    ((op == HBT_VECTOR_INT_FLOAT || op == HBT_VECTOR_INSERT) &&
+	     !memory && rm >= 16) ||
+	    (scalar && memory && src1) ||
 	    !(ctxt->ops->get_cr(ctxt, 4) & X86_CR4_OSXSAVE) || (cr0 & X86_CR0_EM))
 		return emulate_ud(ctxt);
 	ctxt->ops->get_cpuid(ctxt, &eax, &ebx, &ecx, &edx, true);
-	if (!(ecx & BIT(28)) || ctxt->ops->get_xcr(ctxt, 0, &xcr0) ||
-	    (xcr0 & 6) != 6 || (ctxt->hbt_vector.evex && (xcr0 & 0xe6) != 0xe6))
+	if (!(ecx & BIT(28)) || (op == HBT_VECTOR_FMA && !(ecx & BIT(12))) ||
+	    ctxt->ops->get_xcr(ctxt, 0, &xcr0) || (xcr0 & 6) != 6 ||
+	    (ctxt->hbt_vector.evex && (xcr0 & 0xe6) != 0xe6))
 		return emulate_ud(ctxt);
 	eax = 7; ecx = 0;
 	ctxt->ops->get_cpuid(ctxt, &eax, &ebx, &ecx, &edx, true);
 	if ((ctxt->hbt_vector.evex &&
-	     (!(ebx & BIT(16)) || (bytes < 64 && !(ebx & BIT(31))))) ||
+	     (!(ebx & BIT(16)) || (!gpr_move && bytes < 64 && !(ebx & BIT(31))) ||
+	      ((op == HBT_VECTOR_BROADCAST || op == HBT_VECTOR_ADD) &&
+	       elem < 4 && !(ebx & BIT(30))))) ||
 	    (!ctxt->hbt_vector.evex &&
-	     (op == HBT_VECTOR_BROADCAST || (bytes == 32 && op <= HBT_VECTOR_ADD)) &&
+	     (op == HBT_VECTOR_BROADCAST || (bytes == 32 && op <= HBT_VECTOR_ADD) ||
+	      (op == HBT_VECTOR_INSERT128 && ctxt->b == 0x38)) &&
 	     !(ebx & BIT(5))))
 		return emulate_ud(ctxt);
 	if (cr0 & X86_CR0_TS)
 		return emulate_nm(ctxt);
 	if (ctxt->hbt_vector.mask)
 		mask &= ctxt->ops->hbt_opmask_read(ctxt, ctxt->hbt_vector.mask);
-	if (store && !memory) {
-		unsigned int tmp = reg;
-		reg = rm; rm = tmp;
-	}
 	memset(left, 0, sizeof(left));
 	memset(right, 0, sizeof(right));
 	memset(result, 0, sizeof(result));
+	if (op == HBT_VECTOR_ZERO) {
+		for (i = 0; i < (ctxt->mode == X86EMUL_MODE_PROT64 ? 16 : 8); i++) {
+			if (ctxt->ops->hbt_vector_read(ctxt, i, result))
+				return X86EMUL_UNHANDLEABLE;
+			memset((u8 *)result + (bytes == 16 ? 16 : 0), 0,
+			       bytes == 16 ? 48 : 64);
+			if (ctxt->ops->hbt_vector_write(ctxt, i, result))
+				return X86EMUL_UNHANDLEABLE;
+		}
+		return X86EMUL_CONTINUE;
+	}
+	if (memory && ctxt->hbt_vector.aligned) {
+		unsigned long linear;
+
+		rc = linearize(ctxt, ctxt->memop.addr.mem, bytes, store, &linear);
+		if (rc != X86EMUL_CONTINUE)
+			return rc;
+		if (linear & (bytes - 1))
+			return emulate_gp(ctxt, 0);
+	}
+	if (gpr_move) {
+		if (store) {
+			if (ctxt->ops->hbt_vector_read(ctxt, reg, right))
+				return X86EMUL_UNHANDLEABLE;
+			if (memory) {
+				access.saving = true;
+				/* Check every page for write access before the first store. */
+				if (hbt_xstate_read(&access, 0, left, elem) ||
+				    hbt_xstate_write(&access, 0, right, elem))
+					return access.rc;
+			} else {
+				u64 value = 0;
+
+				memcpy(&value, right, elem);
+				assign_register(reg_rmw(ctxt, rm), value, elem);
+			}
+			return X86EMUL_CONTINUE;
+		}
+		if (memory) {
+			if (hbt_xstate_read(&access, 0, result, elem))
+				return access.rc;
+		} else {
+			u64 value = reg_read(ctxt, rm);
+
+			memcpy(result, &value, elem);
+		}
+		goto commit;
+	}
+	if (store && !memory) {
+		unsigned int tmp = reg;
+
+		reg = rm; rm = tmp;
+	}
 	if (store && memory) {
 		if (ctxt->ops->hbt_vector_read(ctxt, reg, right))
 			return X86EMUL_UNHANDLEABLE;
 		access.saving = true;
-		for (i = 0; i < bytes / 4; i++)
-			if ((mask & BIT(i)) && hbt_xstate_write(&access, i * 4, &right[i], 4))
+		if (scalar) {
+			if (hbt_xstate_read(&access, 0, left, elem) ||
+			    hbt_xstate_write(&access, 0, right, elem))
 				return access.rc;
+		} else {
+			for (i = 0; i < lanes; i++)
+				if ((mask & BIT_ULL(i)) &&
+				    hbt_xstate_write(&access, i * elem,
+						     (u8 *)right + i * elem, elem))
+					return access.rc;
+		}
 		return X86EMUL_CONTINUE;
 	}
-	if (op <= HBT_VECTOR_ADD && ctxt->ops->hbt_vector_read(ctxt, src1, left))
+	if ((op <= HBT_VECTOR_ADD || op == HBT_VECTOR_LOGIC || op == HBT_VECTOR_INSERT ||
+	     op == HBT_VECTOR_INSERT128 || fp || (merge && !memory)) &&
+	    ctxt->ops->hbt_vector_read(ctxt, src1, left))
 		return X86EMUL_UNHANDLEABLE;
-	if (!memory) {
+	if (ctxt->hbt_vector.gpr ||
+	    ((op == HBT_VECTOR_INT_FLOAT || op == HBT_VECTOR_INSERT) && !memory)) {
+		u64 value = reg_read(ctxt, rm);
+
+		memcpy(right, &value, input);
+	} else if (!memory) {
 		if (ctxt->ops->hbt_vector_read(ctxt, rm, right))
 			return X86EMUL_UNHANDLEABLE;
-	} else if (op == HBT_VECTOR_BROADCAST || ctxt->hbt_vector.broadcast) {
-		if (mask && hbt_xstate_read(&access, 0, right, 4))
+	} else if (op == HBT_VECTOR_BROADCAST || op == HBT_VECTOR_INSERT ||
+		   op == HBT_VECTOR_INSERT128 ||
+		   ctxt->hbt_vector.broadcast || scalar || fp) {
+		if (mask && hbt_xstate_read(&access, 0, right, input))
 			return access.rc;
 	} else {
 		/* Masked-off lanes do not access guest memory or raise faults. */
-		for (i = 0; i < bytes / 4; i++)
-			if ((mask & BIT(i)) && hbt_xstate_read(&access, i * 4, &right[i], 4))
+		for (i = 0; i < lanes; i++)
+			if ((mask & BIT_ULL(i)) &&
+			    hbt_xstate_read(&access, i * elem, (u8 *)right + i * elem, elem))
 				return access.rc;
+	}
+	if (op == HBT_VECTOR_INSERT) {
+		memcpy(result, left, 16);
+		memcpy((u8 *)result + (ctxt->src.val & (16 / elem - 1)) * elem, right, elem);
+		goto commit;
+	}
+	if (op == HBT_VECTOR_INSERT128) {
+		memcpy(result, left, 32);
+		memcpy((u8 *)result + (ctxt->src.val & 1) * 16, right, 16);
+		goto commit;
+	}
+	if (scalar) {
+		/* Memory loads clear bits 127:element; register forms merge src1. */
+		memcpy(result, left, 16);
+		memcpy(result, right, elem);
+		goto commit;
+	}
+	if (fp) {
+		/* Reserve software backing before the computation changes MXCSR.
+		 * Re-publishing the unchanged destination is conservative for XINUSE
+		 * and leaves no allocation failure after a successful FP operation.
+		 */
+		if (ctxt->ops->hbt_vector_read(ctxt, reg, result) ||
+		    ctxt->ops->hbt_vector_write(ctxt, reg, result))
+			return X86EMUL_UNHANDLEABLE;
+		rc = hbt_scalar_float(ctxt, left, right, result);
+		if (rc != X86EMUL_CONTINUE)
+			return rc;
+		memset(result + 4, 0, 48);
+		goto commit;
 	}
 	if (!ctxt->hbt_vector.zero && ctxt->ops->hbt_vector_read(ctxt, reg, result))
 		return X86EMUL_UNHANDLEABLE;
-	for (i = 0; i < bytes / 4; i++) {
-		u32 value = right[(op == HBT_VECTOR_BROADCAST || ctxt->hbt_vector.broadcast) ? 0 : i];
+	for (i = 0; i < lanes; i++) {
+		const u8 *value = (u8 *)right +
+			((op == HBT_VECTOR_BROADCAST || ctxt->hbt_vector.broadcast) ? 0 : i * elem);
 
-		if (!(mask & BIT(i)))
+		if (!(mask & BIT_ULL(i)))
 			continue;
-		result[i] = op == HBT_VECTOR_ADD ? left[i] + value :
-			    op == HBT_VECTOR_XOR ? left[i] ^ value : value;
+		if (op == HBT_VECTOR_ADD || op == HBT_VECTOR_XOR) {
+			u64 a = 0, b = 0, sum;
+
+			memcpy(&a, (u8 *)left + i * elem, elem);
+			memcpy(&b, value, elem);
+			sum = op == HBT_VECTOR_ADD ? a + b : a ^ b;
+			memcpy((u8 *)result + i * elem, &sum, elem);
+		} else if (op == HBT_VECTOR_LOGIC) {
+			switch (ctxt->b) {
+			case 0x54:
+				result[i] = left[i] & right[i];
+				break;
+			case 0x55:
+				result[i] = ~left[i] & right[i];
+				break;
+			case 0x56:
+				result[i] = left[i] | right[i];
+				break;
+			case 0x57:
+				result[i] = left[i] ^ right[i];
+				break;
+			}
+		} else {
+			memcpy((u8 *)result + i * elem, value, elem);
+		}
 	}
 	/* VEX and EVEX writes clear all bits above the selected vector length. */
 	memset((u8 *)result + bytes, 0, 64 - bytes);
+commit:
 	return ctxt->ops->hbt_vector_write(ctxt, reg, result) ?
 		X86EMUL_UNHANDLEABLE : X86EMUL_CONTINUE;
 }
@@ -5009,13 +5229,14 @@ done:
 static int x86_decode_hbt_vector(struct x86_emulate_ctxt *ctxt, u8 first,
 				u8 p0, struct opcode *opcode)
 {
-	u8 p1, p2 = 0, map, pp, length, v;
+	u8 p1, p2 = 0, map, pp, length, v, elem = 4, op = 0;
+	bool evex = first == 0x62, w;
 	int rc = X86EMUL_CONTINUE;
 
 	*opcode = ud;
 	if (ctxt->rep_prefix || ctxt->op_prefix || ctxt->rex_prefix)
 		return rc;
-	ctxt->hbt_vector.evex = first == 0x62;
+	ctxt->hbt_vector.evex = evex;
 	if (first == 0xc5) {
 		p1 = p0 & 0x7f;
 		p0 = (p0 & 0x80) | 0x61;
@@ -5024,9 +5245,10 @@ static int x86_decode_hbt_vector(struct x86_emulate_ctxt *ctxt, u8 first,
 	}
 	v = (~p1 >> 3) & 15;
 	pp = p1 & 3;
-	if (first == 0x62) {
+	w = p1 & 0x80;
+	if (evex) {
 		p2 = insn_fetch(u8, ctxt);
-		if ((p0 & 0x0c) || !(p1 & 4) || (p1 & 0x80))
+		if ((p0 & 0x0c) || !(p1 & 4))
 			return rc;
 		map = p0 & 3;
 		length = (p2 >> 5) & 3;
@@ -5047,22 +5269,95 @@ static int x86_decode_hbt_vector(struct x86_emulate_ctxt *ctxt, u8 first,
 	ctxt->rex_prefix = REX_PREFIX;
 	ctxt->rex_bits = (~p0 >> 5) & 7;
 	ctxt->b = insn_fetch(u8, ctxt);
-	if (map == 1 && pp == 1 && (ctxt->b == 0xef || ctxt->b == 0xfe))
-		ctxt->hbt_vector.op = ctxt->b == 0xef ? HBT_VECTOR_XOR : HBT_VECTOR_ADD;
-	else if (map == 2 && pp == 1 && ctxt->b == 0x58 && !v)
-		ctxt->hbt_vector.op = HBT_VECTOR_BROADCAST;
-	else if (map == 1 && pp == 2 && (ctxt->b == 0x6f || ctxt->b == 0x7f) && !v)
-		ctxt->hbt_vector.op = ctxt->b == 0x6f ? HBT_VECTOR_LOAD : HBT_VECTOR_STORE;
-	else
+	if (map == 1 && pp == 1 &&
+	    (ctxt->b == 0xef || ctxt->b == 0xfc || ctxt->b == 0xfd ||
+	     ctxt->b == 0xfe || ctxt->b == 0xd4)) {
+		op = ctxt->b == 0xef ? HBT_VECTOR_XOR : HBT_VECTOR_ADD;
+		elem = ctxt->b == 0xfc ? 1 : ctxt->b == 0xfd ? 2 :
+		       ctxt->b == 0xd4 || (evex && w && ctxt->b == 0xef) ? 8 : 4;
+		if (evex && w != (elem == 8))
+			return rc;
+	} else if (map == 2 && pp == 1 && !v &&
+		   (ctxt->b == 0x58 || ctxt->b == 0x59 ||
+		    ctxt->b == 0x78 || ctxt->b == 0x79)) {
+		op = HBT_VECTOR_BROADCAST;
+		elem = ctxt->b == 0x58 ? 4 : ctxt->b == 0x59 ? 8 :
+		       ctxt->b == 0x78 ? 1 : 2;
+		if (evex ? w != (elem == 8) : w)
+			return rc;
+	} else if (evex && map == 2 && pp == 1 && !v &&
+		   (ctxt->b == 0x7a || ctxt->b == 0x7b || ctxt->b == 0x7c)) {
+		op = HBT_VECTOR_BROADCAST;
+		elem = ctxt->b == 0x7a ? 1 : ctxt->b == 0x7b ? 2 : w ? 8 : 4;
+		if (w && elem < 4)
+			return rc;
+		ctxt->hbt_vector.gpr = true;
+	} else if (map == 1 && (pp == 1 || pp == 2) && !v &&
+		   (ctxt->b == 0x6f || ctxt->b == 0x7f)) {
+		op = ctxt->b == 0x6f ? HBT_VECTOR_LOAD : HBT_VECTOR_STORE;
+		elem = evex && w ? 8 : 4;
+		ctxt->hbt_vector.aligned = pp == 1;
+	} else if (map == 1 && pp == 1 && !v && !length &&
+		   (ctxt->b == 0x6e || ctxt->b == 0x7e)) {
+		op = ctxt->b == 0x6e ? HBT_VECTOR_GPR_LOAD : HBT_VECTOR_GPR_STORE;
+		elem = w && ctxt->mode == X86EMUL_MODE_PROT64 ? 8 : 4;
+	} else if (!evex && map == 1 && (pp == 2 || pp == 3) && !length &&
+		   (ctxt->b == 0x10 || ctxt->b == 0x11)) {
+		op = ctxt->b == 0x10 ? HBT_VECTOR_SCALAR_LOAD : HBT_VECTOR_SCALAR_STORE;
+		elem = pp == 2 ? 4 : 8;
+	} else if (!evex && map == 1 && !v && !length &&
+		   ((pp == 2 && ctxt->b == 0x7e) || (pp == 1 && ctxt->b == 0xd6))) {
+		op = ctxt->b == 0x7e ? HBT_VECTOR_QUAD_LOAD : HBT_VECTOR_QUAD_STORE;
+		elem = 8;
+	} else if (!evex && map == 1 && pp <= 1 && !v &&
+		   (ctxt->b == 0x10 || ctxt->b == 0x11 ||
+		    ctxt->b == 0x28 || ctxt->b == 0x29)) {
+		op = ctxt->b & 1 ? HBT_VECTOR_STORE : HBT_VECTOR_LOAD;
+		ctxt->hbt_vector.aligned = ctxt->b & 0x20;
+	} else if (!evex && map == 1 && pp <= 1 &&
+		   ctxt->b >= 0x54 && ctxt->b <= 0x57) {
+		op = HBT_VECTOR_LOGIC;
+	} else if (!evex && map == 1 && (pp == 2 || pp == 3) && !length &&
+		   ctxt->b == 0x2a) {
+		op = HBT_VECTOR_INT_FLOAT;
+		elem = pp == 2 ? 4 : 8;
+		ctxt->hbt_vector.input_bytes = w && ctxt->mode == X86EMUL_MODE_PROT64 ? 8 : 4;
+	} else if (!evex && map == 1 && (pp == 2 || pp == 3) && !length &&
+		   (ctxt->b == 0x58 || ctxt->b == 0x59 ||
+		    ctxt->b == 0x5c || ctxt->b == 0x5e)) {
+		op = HBT_VECTOR_FLOAT;
+		elem = pp == 2 ? 4 : 8;
+	} else if (!evex && map == 2 && pp == 1 && !length &&
+		   (ctxt->b == 0x99 || ctxt->b == 0xa9 || ctxt->b == 0xb9)) {
+		op = HBT_VECTOR_FMA;
+		elem = w ? 8 : 4;
+	} else if (!evex && map == 3 && pp == 1 && !length && ctxt->b == 0x22) {
+		if (w && ctxt->mode != X86EMUL_MODE_PROT64)
+			return rc;
+		op = HBT_VECTOR_INSERT;
+		elem = w ? 8 : 4;
+	} else if (!evex && map == 3 && pp == 1 && length && !w &&
+		   (ctxt->b == 0x18 || ctxt->b == 0x38)) {
+		op = HBT_VECTOR_INSERT128;
+		elem = 16;
+	} else if (!evex && map == 1 && !pp && !v && ctxt->b == 0x77) {
+		op = HBT_VECTOR_ZERO;
+	} else {
 		return rc;
-	ctxt->opcode_len = map + 1;
-	if (first == 0x62)
+	}
+	ctxt->hbt_vector.op = op;
+	ctxt->hbt_vector.element_bytes = elem;
+	ctxt->opcode_len = map == 1 ? 2 : 3;
+	if (evex)
 		ctxt->disp8_scale = ctxt->hbt_vector.broadcast ||
-			ctxt->hbt_vector.op == HBT_VECTOR_BROADCAST ? 4 : ctxt->hbt_vector.bytes;
+			op == HBT_VECTOR_BROADCAST || op == HBT_VECTOR_GPR_LOAD ||
+			op == HBT_VECTOR_GPR_STORE ? elem : ctxt->hbt_vector.bytes;
 	*opcode = (struct opcode) {
-		.flags = ImplicitOps | ModRM | Unaligned,
+		.flags = ImplicitOps | Unaligned | (op == HBT_VECTOR_ZERO ? 0 : ModRM),
 		.u.execute = em_hbt_vector,
 	};
+	if (op == HBT_VECTOR_INSERT || op == HBT_VECTOR_INSERT128)
+		opcode->flags |= SrcImmUByte;
 done:
 	return rc;
 }

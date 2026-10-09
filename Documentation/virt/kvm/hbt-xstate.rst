@@ -181,9 +181,12 @@ Query-only KVM_CAP_HBT_X86_INTEGER_VECTOR returns version 1 for the bounded
 integer executor. A VMM should require it as well as VIRTUAL_XSTATE to avoid
 starting a vector guest on earlier control/storage-only kernels.
 
-The opt-in decoder accepts VPXOR/VPXORD, VPADDD, VPBROADCASTD and
-VMOVDQU/VMOVDQU32 in 32/64-bit protected mode. VEX lengths are 128/256 bits;
+The opt-in decoder accepts VPXOR/VPXORD/VPXORQ, VPADDB/W/D/Q,
+VPBROADCASTB/W/D/Q and VMOVDQA/VMOVDQU (including EVEX 32/64-bit elements)
+in 32/64-bit protected mode. Broadcasts accept vector/memory sources and
+the EVEX general-register forms. VEX lengths are 128/256 bits;
 EVEX lengths are 128/256/512, with AVX512VL required for the shorter EVEX forms.
+Byte/word EVEX arithmetic and broadcasts additionally require AVX512BW.
 It validates virtual CPUID, CR0/CR4 and XCR0, supports high registers, opmasks,
 merge/zero behavior, broadcast, compressed disp8 and RIP-relative addressing.
 Invalid prefixes, unavailable state/features and unsupported encodings trap.
@@ -213,10 +216,52 @@ plus narrow VEX zeroing, memory broadcast, masked stores, compressed and
 RIP-relative addressing, fault suppression, failed-load state preservation,
 and XCR0/CR0/CR4 guards on the actual KVM backend.
 
-Remaining work includes broader AVX/AVX-512 coverage (floating point, mask
+Scalar VEX execution
+--------------------
+
+The executor also accepts VEX VMOVD/Q (general-register, vector-register and
+memory forms), VMOVSS/SD, VMOVUPS/UPD/APS/APD, VAND/ANDN/OR/XORPS/PD,
+VZEROUPPER/ALL, scalar VADD/SUB/MUL/DIVSS/SD, VFMADD132/213/231SS/SD,
+VCVTSI2SS/SD, VPINSRD/Q, and VINSERTF/I128. Scalar arithmetic uses VEX.L=0;
+EVEX scalar rounding/SAE and packed FP arithmetic are not implemented. Other
+conversions, FMA families and vector operations remain unsupported.
+
+Scalar stores preflight all covered pages with write permissions before
+committing any byte. A fault on the second page therefore leaves the first
+page unchanged, unlike the documented per-lane policy for packed stores.
+
+The scalar arithmetic helper runs host SSE (host FMA for fused operations)
+under kvm_fpu_get/put with the guest's live MXCSR. It saves and restores all
+scratch registers, including native YMM upper halves. Guest memory is read
+before acquiring the FPU lock, and software destination backing is reserved
+before arithmetic changes MXCSR. A host arithmetic exception is caught by
+the kernel exception table; its hardware-generated MXCSR flags are retained,
+the destination is not committed and #XM (or #UD with CR4.OSXMMEXCPT clear)
+is injected into the guest. FMA requires the guest CPUID feature and native
+host FMA. This does not split a fused operation into rounded multiply/add.
+
+The parent repository's ``test-hbt-avx.py`` executes identical VEX bytes in
+native and virtual-XSTATE VMs on the same host. It compares registers, memory,
+flags, MXCSR and faults in 32/64-bit modes at CPL0/3, including rounding,
+NaN payloads, signed zero, DAZ/FTZ, unmasked exceptions, operand aliasing,
+reserved encodings and scalar accesses across a missing second page.
+EVEX broadcasts separately test high registers, 64-bit masks and fault
+suppression. These checks do not establish complete CPU compatibility.
+
+The automatic EPTP experiment has a separate userspace compiler for direct
+legacy SSE execution. Its bounded decoder includes moves, integer operations,
+scalar and packed arithmetic, conversions and inserts. The kernel dispatch
+filter permits those candidates, including four-byte VEX encodings, while
+retaining virtual CR0/CR4/XCR0 and AVX512VL guards. The VMM validates each
+instruction's features, operands, guest mappings and patch placement before
+publishing private code. FMA and other untranslated forms still use this
+kernel fallback. The fallback implementation itself does
+not solve short-instruction placement or add an EPTP floating-point backend.
+
+Remaining work includes broader AVX/AVX-512 coverage (packed floating point, mask
 instructions and gathers/scatters), guest OS context switches/signals, SMP,
 disk/device workloads and performance. XSAVES/XRSTORS and supervisor state
 remain outside the accepted CPU profile.
 
-Specification: Intel SDM Volume 2D, XSAVE/XSAVEOPT/XSAVEC/XRSTOR, and Volume 1,
-Chapter 13 (XSAVE-managed state).
+Specification: Intel SDM Volume 2, instruction references, and Volume 1,
+Chapters 11, 13 and 14 (SIMD exceptions, XSAVE-managed state and AVX/FMA).

@@ -130,6 +130,9 @@ integer executor described in ``hbt-xstate.rst`` is available. Enable
 VIRTUAL_XSTATE to use it; there is no separate ENABLE_CAP operation. This check
 lets VMMs reject older storage/control-only kernels before starting a guest.
 It does not promise the complete AVX2, AVX512F or AVX512VL instruction sets.
+The newer scalar VEX operations documented in ``hbt-xstate.rst`` extend this
+executor; version 1 remains the original minimum subset, not a feature bitmap
+for every added instruction.
 
 KVM_HBT_GET_XSTATE / KVM_HBT_SET_XSTATE
 -------------------------------------
@@ -353,7 +356,11 @@ LIVE_CONFIG bounds a contiguous user RAM allocation at GPA 0 by ``nr_pages``
 GPA page number, N permissions in bits 2:0, H permissions in bits 10:8, and
 optional N/H image addresses. A nonzero image address is copied to a private
 accounted page; a zero address with nonzero permissions pins the corresponding
-user RAM page. Unlisted GPAs are absent. Private pages may occupy otherwise
+user RAM page. QUERY's ``KVM_HBT_EPTP_SHARED_OVERLAY`` output flag specifies that
+identical nonzero image pointers share one private copy across maps and views.
+Each alias retains its own EPT permissions and owns a page reference. This
+allows a helper to read saved gate registers without a userspace round trip.
+Unlisted GPAs are absent. Private pages may occupy otherwise
 unused GPAs below 1 GiB. Duplicate entries, write-without-read permissions,
 unknown bits and out-of-range RAM references are rejected. READ_MAPS copies
 selected private pages back to userspace using page/destination pairs in the
@@ -380,6 +387,11 @@ of guest execution. Pending external IRQ injection is canceled for that
 slice and requeued after its exit, before ordinary guest execution can resume.
 Other pending entry events produce the synthetic suberror
 ``KVM_HBT_EPTP_PENDING_EVENT`` without entering the guest. The private timer
-must not be interpreted as an expired guest LAPIC timer. These mechanisms
+must not be interpreted as an expired guest LAPIC timer. With ``ndata >= 6``,
+``internal.data[5]`` requests canonical recovery for a pending/deferred guest
+event. A timer exit with this field zero may resume the existing private views;
+once an IRQ has been deferred, recovery is required before further slices.
+This avoids recompiling an otherwise uninterrupted loop at every timer exit.
+These mechanisms
 support a bounded experiment, not arbitrary SMP, DMA, SMI, debug, reset or
 migration activity while a view is active.

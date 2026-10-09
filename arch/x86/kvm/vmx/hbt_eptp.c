@@ -34,6 +34,7 @@ struct vmx_hbt_eptp {
 	u32 saved_pin, saved_timer, deferred_irq;
 	bool entered;
 	bool pending_event;
+	bool must_recover;
 	bool live;
 	struct page **pinned;
 	u32 pinned_count, map_count;
@@ -169,6 +170,28 @@ static int live_leaf(struct vmx_hbt_eptp *p, unsigned int view,
 	return 0;
 }
 
+/* Identical nonzero image pointers describe shared private backing. Each
+ * mapping owns a page reference, so free_probe() handles aliases normally.
+ */
+static void *live_overlay_copy(struct vmx_hbt_eptp *p, unsigned int view,
+			      unsigned int index, u64 address)
+{
+	unsigned int v, i;
+
+	for (v = 0; v <= view; v++) {
+		for (i = 0; i < (v == view ? index : p->map_count); i++) {
+			u64 prior = v ? p->maps[i].helper_addr : p->maps[i].normal_addr;
+			void *page = p->map_pages[v][i];
+
+			if (prior == address && page) {
+				get_page(virt_to_page(page));
+				return page;
+			}
+		}
+	}
+	return copy_page_from_user(address);
+}
+
 static int configure_live(struct vcpu_vmx *vmx, struct kvm_hbt_eptp_probe *req)
 {
 	struct vmx_hbt_eptp *p;
@@ -265,7 +288,7 @@ static int configure_live(struct vcpu_vmx *vmx, struct kvm_hbt_eptp_probe *req)
 			u64 value = 0;
 
 			if (perm && address) {
-				void *page = copy_page_from_user(address);
+				void *page = live_overlay_copy(p, v, i, address);
 
 				if (IS_ERR(page)) {
 					ret = PTR_ERR(page);
@@ -347,6 +370,7 @@ long vmx_hbt_eptp_probe(struct kvm_vcpu *vcpu, void __user *argp)
 		req.nr_overlays = KVM_HBT_EPTP_MAX_OVERLAYS;
 		req.view = p ? p->view : 0;
 		req.flags = boot_cpu_has(X86_FEATURE_HYPERVISOR) ? KVM_HBT_EPTP_UNDER_HYPERVISOR : 0;
+		req.flags |= KVM_HBT_EPTP_SHARED_OVERLAY;
 		return copy_to_user(argp, &req, sizeof(req)) ? -EFAULT : 0;
 	case KVM_HBT_EPTP_CONFIG:
 		return configure_probe(vmx, &req);
@@ -392,6 +416,7 @@ bool vmx_hbt_eptp_pending_event(struct vcpu_vmx *vmx)
 		return false;
 	if (p->live && (info & INTR_INFO_INTR_TYPE_MASK) == INTR_TYPE_EXT_INTR) {
 		p->deferred_irq = info;
+		p->must_recover = true;
 		vmx_cancel_injection(&vmx->vcpu);
 		return false;
 	}
@@ -420,7 +445,7 @@ void vmx_hbt_eptp_enter(struct vcpu_vmx *vmx)
 	p->saved_secondary = secondary_exec_controls_get(vmx);
 	p->saved_exceptions = vmcs_read32(EXCEPTION_BITMAP);
 	if (p->live) {
-		/* At most 100 us of guest execution before recovery. This timer
+		/* At most 100 us of guest execution before a checkpoint. This timer
 		 * belongs to the private slice, not to the guest's LAPIC timer.
 		 */
 		p->saved_pin = pin_controls_get(vmx);
@@ -468,12 +493,13 @@ int vmx_hbt_eptp_exit(struct vcpu_vmx *vmx)
 		vmx->hbt_eptp->pending_event = false;
 		run->exit_reason = KVM_EXIT_HBT_EPTP;
 		run->internal.suberror = KVM_HBT_EPTP_PENDING_EVENT;
-		run->internal.ndata = 5;
+		run->internal.ndata = 6;
 		run->internal.data[0] = vmx->hbt_eptp->view;
 		run->internal.data[1] = 0;
 		run->internal.data[2] = 0;
 		run->internal.data[3] = vmcs_read32(VM_ENTRY_INTR_INFO_FIELD);
 		run->internal.data[4] = kvm_rip_read(vcpu);
+		run->internal.data[5] = 1;
 		return 0;
 	}
 	if (!vmx->hbt_eptp->entered || vmx->fail || vmx_get_exit_reason(vcpu).failed_vmentry) {
@@ -485,11 +511,12 @@ int vmx_hbt_eptp_exit(struct vcpu_vmx *vmx)
 	vmx->hbt_eptp->entered = false;
 	run->exit_reason = KVM_EXIT_HBT_EPTP;
 	run->internal.suberror = vmx_get_exit_reason(vcpu).full;
-	run->internal.ndata = 5;
+	run->internal.ndata = 6;
 	run->internal.data[0] = vmx->hbt_eptp->view;
 	run->internal.data[1] = vmcs_readl(EXIT_QUALIFICATION);
 	run->internal.data[2] = vmcs_read32(VM_EXIT_INSTRUCTION_LEN);
 	run->internal.data[3] = vmcs_read32(VM_EXIT_INTR_INFO);
 	run->internal.data[4] = kvm_rip_read(vcpu);
+	run->internal.data[5] = vmx->hbt_eptp->must_recover;
 	return 0;
 }

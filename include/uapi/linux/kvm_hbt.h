@@ -159,6 +159,8 @@ struct kvm_hbt_xstate {
  * Every hardware exit is returned without guest instruction emulation:
  * run->internal.suberror = raw VMX exit reason; data[0..4] = view,
  * qualification, instruction length, interrupt information, guest RIP.
+ * ndata >= 6: data[5] requires recovery for a deferred guest event. A private
+ * slice-timer exit (reason 52) with data[5] == 0 can resume the existing views.
  * No physical addresses are accepted from or returned to userspace.
  */
 #define KVM_HBT_EPTP_VERSION 1
@@ -172,6 +174,7 @@ struct kvm_hbt_xstate {
 #define KVM_HBT_EPTP_MAX_PAGES 512
 #define KVM_HBT_EPTP_MAX_OVERLAYS 16
 #define KVM_HBT_EPTP_UNDER_HYPERVISOR 1 /* QUERY output; timing is not L0 evidence */
+#define KVM_HBT_EPTP_SHARED_OVERLAY 2 /* QUERY: identical image pointers share backing */
 #define KVM_EXIT_HBT_EPTP 0x48425402
 
 struct kvm_hbt_eptp_overlay {
@@ -184,6 +187,8 @@ struct kvm_hbt_eptp_overlay {
  * Only explicitly listed RAM pages are pinned; all other GPAs are unmapped.
  * Up to 16 mappings select pages: permissions bits 2:0 are N R/W/X, bits 10:8 H.
  * A zero image pointer selects pinned RAM; nonzero copies a private page.
+ * With SHARED_OVERLAY, repeated nonzero pointers alias the same private copy
+ * across maps/views. Each EPT leaf retains its own access permissions.
  * Extra GPAs below 1 GiB are allowed only with private images. READ_MAPS
  * uses an array of kvm_hbt_eptp_overlay as page/destination pairs, nr_pages
  * and image_addr zero, and view 0/1. This remains an opt-in laboratory ABI.
