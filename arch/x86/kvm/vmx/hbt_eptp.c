@@ -592,7 +592,7 @@ long vmx_hbt_eptp_probe(struct kvm_vcpu *vcpu, void __user *argp)
 		req.flags = boot_cpu_has(X86_FEATURE_HYPERVISOR) ? KVM_HBT_EPTP_UNDER_HYPERVISOR : 0;
 		req.flags |= KVM_HBT_EPTP_SHARED_OVERLAY | KVM_HBT_EPTP_LAZY_DATA |
 			     KVM_HBT_EPTP_PERSISTENT | KVM_HBT_EPTP_CONTEXT_CACHE |
-			     KVM_HBT_EPTP_RANGE_IO;
+			     KVM_HBT_EPTP_RANGE_IO | KVM_HBT_EPTP_CONTEXT_IO;
 		req.reserved[0] = KVM_HBT_EPTP_MAX_CONTEXTS;
 		return copy_to_user(argp, &req, sizeof(req)) ? -EFAULT : 0;
 	case KVM_HBT_EPTP_CONFIG:

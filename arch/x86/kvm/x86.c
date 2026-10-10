@@ -138,6 +138,9 @@ static int kvm_vcpu_do_singlestep(struct kvm_vcpu *vcpu);
 
 static int __set_sregs2(struct kvm_vcpu *vcpu, struct kvm_sregs2 *sregs2);
 static void __get_sregs2(struct kvm_vcpu *vcpu, struct kvm_sregs2 *sregs2);
+static void __get_regs(struct kvm_vcpu *vcpu, struct kvm_regs *regs);
+static void __set_regs(struct kvm_vcpu *vcpu, struct kvm_regs *regs);
+static void __get_sregs(struct kvm_vcpu *vcpu, struct kvm_sregs *sregs);
 
 static DEFINE_MUTEX(vendor_module_lock);
 static void kvm_load_guest_fpu(struct kvm_vcpu *vcpu);
@@ -6232,6 +6235,95 @@ static int kvm_get_reg_list(struct kvm_vcpu *vcpu,
 	return 0;
 }
 
+/* Already inside the vCPU mutex and vcpu_load(), unlike the public regs APIs. */
+static int kvm_hbt_context_ioctl(struct kvm_vcpu *vcpu, unsigned int cmd, void __user *argp)
+{
+	struct kvm_hbt_context req;
+	struct {
+		struct kvm_regs regs;
+		struct kvm_xsave xsave;
+		struct kvm_sregs sregs;
+		struct kvm_xcrs xcrs;
+		struct kvm_debugregs debug;
+	} *state;
+	struct kvm_hbt_xstate *soft;
+	bool set = cmd == KVM_HBT_SET_CONTEXT;
+	int ret;
+
+	if (!vcpu->kvm->arch.hbt_xstate_storage_enabled ||
+	    vcpu->arch.guest_state_protected || is_guest_mode(vcpu) ||
+	    fpstate_is_confidential(&vcpu->arch.guest_fpu) ||
+	    vcpu->arch.guest_fpu.uabi_size > sizeof(struct kvm_xsave))
+		return -EOPNOTSUPP;
+	if (copy_from_user(&req, argp, sizeof(req)))
+		return -EFAULT;
+	if (req.version != KVM_HBT_CONTEXT_VERSION ||
+	    req.flags & ~KVM_HBT_CONTEXT_CONTROL || (set && req.flags) ||
+	    req.reserved[0] || req.reserved[1] ||
+	    !req.regs_addr || !req.xsave_addr || !req.xstate_addr)
+		return -EINVAL;
+	if (req.flags & KVM_HBT_CONTEXT_CONTROL) {
+		if (!req.sregs_addr || !req.xcrs_addr || !req.debug_addr)
+			return -EINVAL;
+	} else if (req.sregs_addr || req.xcrs_addr || req.debug_addr) {
+		return -EINVAL;
+	}
+	state = kzalloc_obj(*state, GFP_KERNEL_ACCOUNT);
+	soft = kzalloc_obj(*soft, GFP_KERNEL_ACCOUNT);
+	if (!state || !soft) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	if (set) {
+		ret = -EFAULT;
+		if (copy_from_user(&state->regs, u64_to_user_ptr(req.regs_addr), sizeof(state->regs)) ||
+		    copy_from_user(&state->xsave, u64_to_user_ptr(req.xsave_addr), sizeof(state->xsave)) ||
+		    copy_from_user(soft, u64_to_user_ptr(req.xstate_addr), sizeof(*soft)))
+			goto out;
+		ret = kvm_hbt_xstate_validate(soft);
+		if (ret)
+			goto out;
+		/* The kernel-buffer XSAVE importer validates its header and MXCSR
+		 * before writing fpstate; no user copy can fault after that point.
+		 * The remaining soft-state publication and __set_regs cannot fail.
+		 */
+		ret = kvm_vcpu_ioctl_x86_set_xsave(vcpu, &state->xsave);
+		if (ret)
+			goto out;
+		kvm_hbt_xstate_free(vcpu);
+		vcpu->arch.hbt_xstate = soft;
+		soft = NULL;
+		__set_regs(vcpu, &state->regs);
+	} else {
+		__get_regs(vcpu, &state->regs);
+		ret = kvm_vcpu_ioctl_x86_get_xsave(vcpu, &state->xsave);
+		if (ret)
+			goto out;
+		kvm_hbt_xstate_get(vcpu, soft);
+		if (req.flags & KVM_HBT_CONTEXT_CONTROL) {
+			__get_sregs(vcpu, &state->sregs);
+			ret = kvm_vcpu_ioctl_x86_get_xcrs(vcpu, &state->xcrs);
+			if (!ret)
+				ret = kvm_vcpu_ioctl_x86_get_debugregs(vcpu, &state->debug);
+			if (ret)
+				goto out;
+			if (copy_to_user(u64_to_user_ptr(req.sregs_addr), &state->sregs, sizeof(state->sregs)) ||
+			    copy_to_user(u64_to_user_ptr(req.xcrs_addr), &state->xcrs, sizeof(state->xcrs)) ||
+			    copy_to_user(u64_to_user_ptr(req.debug_addr), &state->debug, sizeof(state->debug))) {
+				ret = -EFAULT;
+				goto out;
+			}
+		}
+		ret = copy_to_user(u64_to_user_ptr(req.regs_addr), &state->regs, sizeof(state->regs)) ||
+		      copy_to_user(u64_to_user_ptr(req.xsave_addr), &state->xsave, sizeof(state->xsave)) ||
+		      copy_to_user(u64_to_user_ptr(req.xstate_addr), soft, sizeof(*soft)) ? -EFAULT : 0;
+	}
+out:
+	kfree(state);
+	kfree(soft);
+	return ret;
+}
+
 long kvm_arch_vcpu_ioctl(struct file *filp,
 			 unsigned int ioctl, unsigned long arg)
 {
@@ -6250,6 +6342,10 @@ long kvm_arch_vcpu_ioctl(struct file *filp,
 
 	u.buffer = NULL;
 	switch (ioctl) {
+	case KVM_HBT_GET_CONTEXT:
+	case KVM_HBT_SET_CONTEXT:
+		r = kvm_hbt_context_ioctl(vcpu, ioctl, argp);
+		break;
 	case KVM_HBT_EPTP_PROBE:
 		r = kvm_x86_ops.hbt_eptp_probe ?
 			kvm_x86_call(hbt_eptp_probe)(vcpu, argp) : -EOPNOTSUPP;

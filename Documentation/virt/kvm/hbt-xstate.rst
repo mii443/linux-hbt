@@ -9,6 +9,33 @@ state. A bounded integer VEX/EVEX executor and the parent repository's QEMU
 integration now support native AVX-512 -> AVX2/HBT live migration of the
 validation guest, including re-export after software execution.
 
+Batched architectural checkpoints
+---------------------------------
+
+``KVM_HBT_GET_CONTEXT`` and ``KVM_HBT_SET_CONTEXT`` exchange GPRs, the native
+4096-byte XSAVE area and software AVX-512 state under one vCPU load and mutex.
+EPTP QUERY advertises ``KVM_HBT_EPTP_CONTEXT_IO`` so the VMM can retain the
+individual-ioctl path on older modules. HBT software-XSTATE storage must be
+enabled. Protected/nested state and larger native XSAVE areas are rejected.
+
+The versioned request contains three userspace pointers to the existing state
+structures. GET with ``KVM_HBT_CONTEXT_CONTROL`` also retrieves SREGS, XCRS and
+debug registers for admission checks. SET accepts no control-state pointers.
+Reserved fields and unknown flags must be zero. GET copy failures may leave
+incomplete output buffers, which the caller must discard.
+
+SET copies every input and allocates software-state backing before publication.
+Software-state validation and the kernel-buffer XSAVE importer reject invalid
+component masks, reserved fields and MXCSR before changing architectural state.
+The remaining register/software-state publication cannot fail. This preserves
+the existing individual-ioctl semantics, including SET_REGS event handling;
+it does not transfer deferred events or translation-cache contents. The VMM
+still canonicalizes a helper checkpoint and suspends its EPT views before SET.
+
+The parent repository's ``hbt-context-live.c`` compares batched and individual
+results, vCPU isolation, 18 invalid SET cases with unchanged full state, GET
+copy faults, and initialization of absent software components.
+
 Bounded EPTP-switching experiment
 --------------------------------
 

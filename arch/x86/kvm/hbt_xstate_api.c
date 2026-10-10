@@ -18,7 +18,7 @@ void kvm_hbt_xstate_free(struct kvm_vcpu *vcpu)
 	vcpu->arch.hbt_xstate = NULL;
 }
 
-static int validate(struct kvm_hbt_xstate *state)
+int kvm_hbt_xstate_validate(struct kvm_hbt_xstate *state)
 {
 	unsigned int i;
 
@@ -39,6 +39,18 @@ static int validate(struct kvm_hbt_xstate *state)
 	return 0;
 }
 
+void kvm_hbt_xstate_get(struct kvm_vcpu *vcpu, struct kvm_hbt_xstate *state)
+{
+	if (vcpu->arch.hbt_xstate) {
+		*state = *vcpu->arch.hbt_xstate;
+	} else {
+		memset(state, 0, sizeof(*state));
+		state->version = KVM_HBT_XSTATE_VERSION;
+		state->size = sizeof(*state);
+		state->xfeatures = KVM_HBT_XSTATE_FEATURES;
+	}
+}
+
 long kvm_hbt_xstate_ioctl(struct kvm_vcpu *vcpu, unsigned int cmd, void __user *argp)
 {
 	struct kvm_hbt_xstate *state;
@@ -53,19 +65,13 @@ long kvm_hbt_xstate_ioctl(struct kvm_vcpu *vcpu, unsigned int cmd, void __user *
 	if (!state)
 		return -ENOMEM;
 	if (cmd == KVM_HBT_GET_XSTATE) {
-		if (vcpu->arch.hbt_xstate) {
-			*state = *vcpu->arch.hbt_xstate;
-		} else {
-			state->version = KVM_HBT_XSTATE_VERSION;
-			state->size = sizeof(*state);
-			state->xfeatures = KVM_HBT_XSTATE_FEATURES;
-		}
+		kvm_hbt_xstate_get(vcpu, state);
 		ret = copy_to_user(argp, state, sizeof(*state)) ? -EFAULT : 0;
 	} else {
 		ret = -EFAULT;
 		if (copy_from_user(state, argp, sizeof(*state)))
 			goto out;
-		ret = validate(state);
+		ret = kvm_hbt_xstate_validate(state);
 		if (!ret) {
 			/* All fallible work precedes publication under the vCPU mutex. */
 			kvm_hbt_xstate_free(vcpu);

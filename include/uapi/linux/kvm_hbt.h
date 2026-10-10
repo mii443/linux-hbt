@@ -152,6 +152,26 @@ struct kvm_hbt_xstate {
 #define KVM_HBT_SET_XSTATE \
 	_IOW(0xae, 0xef, struct kvm_hbt_xstate)
 
+/* Batched architectural state exchange under one vCPU load/mutex.
+ * The three mandatory pointers address struct kvm_regs, struct kvm_xsave
+ * (4096 bytes), and struct kvm_hbt_xstate. GET with CONTROL also supplies
+ * struct kvm_sregs, struct kvm_xcrs and struct kvm_debugregs. Otherwise the
+ * control pointers must be zero; SET never changes control state.
+ * All SET inputs are copied/validated before publication. GET copy faults
+ * may leave a partial userspace snapshot, but never change guest state.
+ * Native XSAVE areas larger than 4096 and protected/nested guests are rejected.
+ */
+#define KVM_HBT_CONTEXT_VERSION 1
+#define KVM_HBT_CONTEXT_CONTROL 1U
+struct kvm_hbt_context {
+	__u32 version, flags;
+	__u64 regs_addr, xsave_addr, xstate_addr;
+	__u64 sregs_addr, xcrs_addr, debug_addr;
+	__u64 reserved[2];
+};
+#define KVM_HBT_GET_CONTEXT _IOW(0xae, 0xf1, struct kvm_hbt_context)
+#define KVM_HBT_SET_CONTEXT _IOW(0xae, 0xf2, struct kvm_hbt_context)
+
 /*
  * Bounded VMX laboratory interface, NOT a migratable RAM/translation API.
  * CONFIG copies nr_pages of RAM at GPA 0 and up to MAX_OVERLAYS private helper pages.
@@ -189,6 +209,7 @@ struct kvm_hbt_xstate {
 #define KVM_HBT_EPTP_PERSISTENT 8 /* QUERY: SUSPEND/RESUME and larger map budget */
 #define KVM_HBT_EPTP_CONTEXT_CACHE 16 /* QUERY: keyed operations; reserved[0] limit */
 #define KVM_HBT_EPTP_RANGE_IO 32 /* QUERY: READ_RANGES/RESUME_RANGES */
+#define KVM_HBT_EPTP_CONTEXT_IO 64 /* QUERY: batched GET/SET_CONTEXT */
 #define KVM_EXIT_HBT_EPTP 0x48425402
 
 struct kvm_hbt_eptp_overlay {
