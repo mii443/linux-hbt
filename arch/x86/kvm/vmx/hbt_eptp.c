@@ -34,10 +34,9 @@ struct vmx_hbt_eptp {
 	u32 pages, view;
 	u64 saved_eptp, saved_function, saved_list;
 	u32 saved_secondary, saved_exceptions;
-	u32 saved_pin, saved_timer, deferred_irq;
+	u32 saved_pin, saved_timer;
 	bool entered;
 	bool pending_event;
-	bool must_recover;
 	bool live;
 	struct page **pinned;
 	u32 pinned_count, map_count;
@@ -539,7 +538,6 @@ static int resume_live(struct vcpu_vmx *vmx, struct vmx_hbt_eptp **slot,
 	p->view = 0;
 	p->entered = false;
 	p->pending_event = false;
-	p->must_recover = false;
 	/* A canonical dirty-log collection may have cleared the first MAP_DATA
 	 * marks while this context was parked. Retained writable leaves bypass
 	 * the ordinary MMU, so conservatively mark them again on reactivation.
@@ -633,7 +631,7 @@ long vmx_hbt_eptp_probe(struct kvm_vcpu *vcpu, void __user *argp)
 		if (req.nr_pages || req.view || req.image_addr ||
 		    req.overlays_addr || req.nr_overlays)
 			return -EINVAL;
-		if (!p || !p->live || p->entered || p->deferred_irq)
+		if (!p || !p->live || p->entered)
 			return -EBUSY;
 		if (p->key) {
 			park_context(vmx, p);
@@ -670,9 +668,11 @@ long vmx_hbt_eptp_probe(struct kvm_vcpu *vcpu, void __user *argp)
 	}
 }
 
-/* Guest IRQs may wait for the bounded private execution slice. Never let
- * an injected event expose helper state to guest handlers. Non-IRQ events
- * instead ask userspace to recover before any VM entry.
+/* Recover before EVERY injected event, including external IRQs. Deferring an
+ * IRQ across another private slice permits SYSCALL to clear IF. Requeueing it
+ * as already injected then bypasses interrupt_allowed() and can cause an
+ * invalid VM entry. Leave the injection intact and never advance guest RIP
+ * before userspace has restored a canonical checkpoint.
  */
 bool vmx_hbt_eptp_pending_event(struct vcpu_vmx *vmx)
 {
@@ -681,25 +681,8 @@ bool vmx_hbt_eptp_pending_event(struct vcpu_vmx *vmx)
 
 	if (!(info & INTR_INFO_VALID_MASK))
 		return false;
-	if (p->live && (info & INTR_INFO_INTR_TYPE_MASK) == INTR_TYPE_EXT_INTR) {
-		p->deferred_irq = info;
-		p->must_recover = true;
-		vmx_cancel_injection(&vmx->vcpu);
-		return false;
-	}
 	p->pending_event = true;
 	return true;
-}
-
-void vmx_hbt_eptp_complete_interrupts(struct vcpu_vmx *vmx)
-{
-	struct vmx_hbt_eptp *p = vmx->hbt_eptp;
-
-	if (p->deferred_irq) {
-		kvm_queue_interrupt(&vmx->vcpu, p->deferred_irq & INTR_INFO_VECTOR_MASK, false);
-		kvm_make_request(KVM_REQ_EVENT, &vmx->vcpu);
-		p->deferred_irq = 0;
-	}
 }
 
 void vmx_hbt_eptp_enter(struct vcpu_vmx *vmx)
@@ -785,7 +768,7 @@ int vmx_hbt_eptp_exit(struct vcpu_vmx *vmx)
 	run->internal.data[2] = vmcs_read32(VM_EXIT_INSTRUCTION_LEN);
 	run->internal.data[3] = vmcs_read32(VM_EXIT_INTR_INFO);
 	run->internal.data[4] = kvm_rip_read(vcpu);
-	run->internal.data[5] = vmx->hbt_eptp->must_recover;
+	run->internal.data[5] = 0; /* pending injections return before hardware entry */
 	run->internal.data[6] = vmx_get_exit_reason(vcpu).basic == EXIT_REASON_EPT_VIOLATION ?
 		vmcs_read64(GUEST_PHYSICAL_ADDRESS) : 0;
 	return 0;

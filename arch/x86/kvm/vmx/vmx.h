@@ -360,7 +360,6 @@ void set_cr4_guest_host_mask(struct vcpu_vmx *vmx);
 long vmx_hbt_eptp_probe(struct kvm_vcpu *vcpu, void __user *argp);
 void vmx_hbt_eptp_free(struct vcpu_vmx *vmx);
 bool vmx_hbt_eptp_pending_event(struct vcpu_vmx *vmx);
-void vmx_hbt_eptp_complete_interrupts(struct vcpu_vmx *vmx);
 void vmx_hbt_eptp_enter(struct vcpu_vmx *vmx);
 void vmx_hbt_eptp_leave(struct vcpu_vmx *vmx);
 int vmx_hbt_eptp_exit(struct vcpu_vmx *vmx);

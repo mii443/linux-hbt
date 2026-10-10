@@ -7803,7 +7803,6 @@ fastpath_t vmx_vcpu_run(struct kvm_vcpu *vcpu, u64 run_flags)
 	vmx_complete_interrupts(vmx);
 
 	if (unlikely(vmx->hbt_eptp)) {
-		vmx_hbt_eptp_complete_interrupts(vmx);
 		return EXIT_FASTPATH_NONE;
 	}
 	return vmx_exit_handlers_fastpath(vcpu, force_immediate_exit);

@@ -39,6 +39,15 @@ copy faults, and initialization of absent software components.
 Bounded EPTP-switching experiment
 --------------------------------
 
+Every pending VM-entry event, including an external IRQ, requests userspace
+recovery before further private execution. The injection stays intact until
+the VMM suspends the views with canonical state. An earlier deferred-IRQ path
+could execute SYSCALL (clearing IF) and then mark the delayed IRQ as already
+injected, bypassing the normal interrupt-allowed check and producing VM-entry
+error ``0x80000021``. The private slice timer can still resume a view when no
+guest event is pending. The parent mixed FP/GPR-loop test additionally stresses
+10,000 user SYSCALL transitions under asynchronous signals.
+
 ``kvm_intel.hbt_eptp_probe=1`` enables the private ``KVM_HBT_EPTP_PROBE``
 vCPU ioctl declared in ``linux/kvm_hbt.h``. It defaults off and requires Intel
 EPT, VPID and VMFUNC function 0 support. It is a test RAM backend: CONFIG copies
