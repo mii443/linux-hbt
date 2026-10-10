@@ -202,7 +202,7 @@ struct kvm_hbt_context {
 #define KVM_HBT_EPTP_RESUME_RANGES 13 /* refresh ranges; optional reserved[0] key */
 #define KVM_HBT_EPTP_MAX_CONTEXTS 64
 #define KVM_HBT_EPTP_MAX_PAGES 512
-#define KVM_HBT_EPTP_MAX_OVERLAYS 256
+#define KVM_HBT_EPTP_MAX_OVERLAYS 512
 #define KVM_HBT_EPTP_UNDER_HYPERVISOR 1 /* QUERY output; timing is not L0 evidence */
 #define KVM_HBT_EPTP_SHARED_OVERLAY 2 /* QUERY: identical image pointers share backing */
 #define KVM_HBT_EPTP_LAZY_DATA 4 /* QUERY: MAP_DATA and exit data[6] GPA */

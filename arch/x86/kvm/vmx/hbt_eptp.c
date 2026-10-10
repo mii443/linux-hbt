@@ -19,11 +19,22 @@
 #include "../x86.h"
 #include "../smm.h"
 
-#define HBT_LAZY_DATA_PAGES 256
+#define HBT_LAZY_DATA_MAX_PAGES 4096
 
 static bool __read_mostly hbt_eptp_probe;
 module_param(hbt_eptp_probe, bool, 0444);
 MODULE_PARM_DESC(hbt_eptp_probe, "Enable the bounded HBT VMFUNC test interface");
+
+static bool __read_mostly hbt_eptp_tlb_cache = true;
+module_param(hbt_eptp_tlb_cache, bool, 0644);
+MODULE_PARM_DESC(hbt_eptp_tlb_cache, "Reuse unchanged HBT translations on the same CPU");
+
+/* Applied to newly created contexts only. Keep pinning bounded independently
+ * of executable overlays; a larger working set must not flush translated code.
+ */
+static unsigned int __read_mostly hbt_eptp_data_pages = 1024;
+module_param(hbt_eptp_data_pages, uint, 0644);
+MODULE_PARM_DESC(hbt_eptp_data_pages, "Maximum lazy data pages per new HBT context (16..4096)");
 
 struct vmx_hbt_eptp {
 	u64 key, age;
@@ -37,11 +48,14 @@ struct vmx_hbt_eptp {
 	u32 saved_pin, saved_timer;
 	bool entered;
 	bool pending_event;
+	bool tlb_valid;
+	int tlb_cpu;
 	bool live;
 	struct page **pinned;
 	u32 pinned_count, map_count;
 	u64 ram_hva;
-	u32 ram_pages, data_count, data_pages[HBT_LAZY_DATA_PAGES];
+	u32 ram_pages, data_count, data_limit;
+	u32 *data_pages;
 	u64 *live_pts[2][512];
 	struct kvm_hbt_eptp_live_map maps[KVM_HBT_EPTP_MAX_OVERLAYS];
 	void *map_pages[2][KVM_HBT_EPTP_MAX_OVERLAYS];
@@ -56,6 +70,7 @@ static void free_probe(struct vmx_hbt_eptp *p)
 	if (p->pinned_count)
 		unpin_user_pages_dirty_lock(p->pinned, p->pinned_count, true);
 	kvfree(p->pinned);
+	kvfree(p->data_pages);
 	for (v = 0; v < 2; v++) {
 		for (i = 1; i < 512; i++)
 			free_page((unsigned long)p->live_pts[v][i]);
@@ -70,7 +85,7 @@ static void free_probe(struct vmx_hbt_eptp *p)
 		for (l = 0; l < 4; l++)
 			free_page((unsigned long)p->tables[v][l]);
 	free_page((unsigned long)p->list);
-	kfree(p);
+	kvfree(p);
 }
 
 void vmx_hbt_eptp_free(struct vcpu_vmx *vmx)
@@ -157,7 +172,7 @@ static int configure_probe(struct vcpu_vmx *vmx, struct kvm_hbt_eptp_probe *req)
 			if (overlays[l].page == overlays[i].page)
 				return -EINVAL;
 	}
-	p = kzalloc_obj(*p, GFP_KERNEL_ACCOUNT);
+	p = kvzalloc_obj(*p, GFP_KERNEL_ACCOUNT);
 	if (!p)
 		return -ENOMEM;
 	p->pages = req->nr_pages;
@@ -241,7 +256,7 @@ static int configure_live(struct vcpu_vmx *vmx, struct kvm_hbt_eptp_probe *req)
 {
 	struct vmx_hbt_eptp *p;
 	struct vmx_hbt_eptp **old;
-	unsigned int i, j, v, l;
+	unsigned int i, j, v, l, data_limit = READ_ONCE(hbt_eptp_data_pages);
 	u64 *ram_leaves __free(kfree) = NULL;
 	long pinned;
 	int ret = -ENOMEM;
@@ -253,12 +268,13 @@ static int configure_live(struct vcpu_vmx *vmx, struct kvm_hbt_eptp_probe *req)
 		return -EOPNOTSUPP;
 	if (vmx->hbt_eptp)
 		return -EBUSY;
-	if (!req->nr_pages || req->nr_pages > KVM_HBT_EPTP_LIVE_MAX_PAGES ||
+	if (data_limit < 16 || data_limit > HBT_LAZY_DATA_MAX_PAGES ||
+	    !req->nr_pages || req->nr_pages > KVM_HBT_EPTP_LIVE_MAX_PAGES ||
 	    req->nr_overlays > KVM_HBT_EPTP_MAX_OVERLAYS || req->view ||
 	    offset_in_page(req->image_addr) ||
 	    req->image_addr > ULONG_MAX - (u64)req->nr_pages * PAGE_SIZE)
 		return -EINVAL;
-	p = kzalloc_obj(*p, GFP_KERNEL_ACCOUNT);
+	p = kvzalloc_obj(*p, GFP_KERNEL_ACCOUNT);
 	if (!p)
 		return -ENOMEM;
 	ram_leaves = kcalloc(req->nr_overlays, sizeof(*ram_leaves), GFP_KERNEL_ACCOUNT);
@@ -269,6 +285,7 @@ static int configure_live(struct vcpu_vmx *vmx, struct kvm_hbt_eptp_probe *req)
 	p->ram_hva = req->image_addr;
 	p->ram_pages = req->nr_pages;
 	p->map_count = req->nr_overlays;
+	p->data_limit = min(data_limit, req->nr_pages);
 	if (copy_from_user(p->maps, u64_to_user_ptr(req->overlays_addr),
 			   p->map_count * sizeof(p->maps[0]))) {
 		ret = -EFAULT;
@@ -292,9 +309,11 @@ static int configure_live(struct vcpu_vmx *vmx, struct kvm_hbt_eptp_probe *req)
 				goto fail;
 		}
 	}
-	p->pinned = kvmalloc_array(p->map_count + HBT_LAZY_DATA_PAGES,
-				  sizeof(*p->pinned), GFP_KERNEL_ACCOUNT);
-	if (!p->pinned) {
+	p->pinned = kvmalloc_array(p->map_count + p->data_limit,
+				   sizeof(*p->pinned), GFP_KERNEL_ACCOUNT);
+	p->data_pages = kvmalloc_array(p->data_limit, sizeof(*p->data_pages),
+				       GFP_KERNEL_ACCOUNT);
+	if (!p->pinned || !p->data_pages) {
 		ret = -ENOMEM;
 		goto fail;
 	}
@@ -390,7 +409,7 @@ static int map_live_data(struct kvm_vcpu *vcpu, struct vmx_hbt_eptp *p,
 	for (i = 0; i < p->data_count; i++)
 		if (p->data_pages[i] == page)
 			return 0;
-	if (p->data_count == HBT_LAZY_DATA_PAGES)
+	if (p->data_count == p->data_limit)
 		return -ENOSPC;
 	count = pin_user_pages_fast(p->ram_hva + (u64)page * PAGE_SIZE, 1,
 				   FOLL_WRITE | FOLL_LONGTERM, &pinned);
@@ -398,6 +417,7 @@ static int map_live_data(struct kvm_vcpu *vcpu, struct vmx_hbt_eptp *p,
 		return count < 0 ? count : -EFAULT;
 	p->pinned[p->pinned_count++] = pinned;
 	p->data_pages[p->data_count++] = page;
+	p->tlb_valid = false;
 	for (i = 0; i < 2; i++) {
 		ret = live_leaf(p, i, page, page_to_phys(pinned) | 0x73);
 		if (ret)
@@ -538,6 +558,10 @@ static int resume_live(struct vcpu_vmx *vmx, struct vmx_hbt_eptp **slot,
 	p->view = 0;
 	p->entered = false;
 	p->pending_event = false;
+	/* The refreshed overlays can include guest page tables. Invalidate
+	 * combined translations even when the EPT leaves themselves are unchanged.
+	 */
+	p->tlb_valid = false;
 	/* A canonical dirty-log collection may have cleared the first MAP_DATA
 	 * marks while this context was parked. Retained writable leaves bypass
 	 * the ordinary MMU, so conservatively mark them again on reactivation.
@@ -705,9 +729,18 @@ void vmx_hbt_eptp_enter(struct vcpu_vmx *vmx)
 			max_t(u32, 1, (tsc_khz / 10) >>
 			      vmx_misc_preemption_timer_rate(vmcs_config.misc)));
 	}
-	/* Also handles CPU migration and reuse of freed physical EPT root pages. */
-	ept_sync_context(p->list[0]);
-	ept_sync_context(p->list[1]);
+	/* New objects start invalid. Refreshes and leaf changes invalidate them;
+	 * movement to another CPU always flushes there, including a return to a
+	 * previously used CPU. Thus freed/reused roots cannot inherit stale entries.
+	 * The vCPU is serialized and migration is disabled throughout this hook.
+	 */
+	if (!READ_ONCE(hbt_eptp_tlb_cache) || !p->tlb_valid ||
+	    p->tlb_cpu != smp_processor_id()) {
+		ept_sync_context(p->list[0]);
+		ept_sync_context(p->list[1]);
+		p->tlb_cpu = smp_processor_id();
+		p->tlb_valid = true;
+	}
 	vmcs_write64(EPTP_LIST_ADDRESS, __pa(p->list));
 	vmcs_write64(VM_FUNCTION_CONTROL, VMX_VMFUNC_EPTP_SWITCHING);
 	vmcs_write64(EPT_POINTER, p->list[p->view]);
