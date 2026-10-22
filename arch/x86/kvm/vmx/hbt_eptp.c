@@ -4,7 +4,7 @@
  * LIVE_CONFIG pins explicitly listed user RAM pages and copies private overlays.
  * No arbitrary userspace physical addresses enter the EPTs. Every exit returns
  * to userspace for state recovery before ordinary KVM handles guest events.
- * This is a fixed-RAM, single-vCPU experiment, not a general memory backend.
+ * This is a single-vCPU experiment with bounded overlays and pinned data.
  */
 #include <linux/moduleparam.h>
 #include <linux/mm.h>
@@ -20,6 +20,7 @@
 #include "../smm.h"
 
 #define HBT_LAZY_DATA_MAX_PAGES 4096
+#define HBT_LIVE_TABLE_MAX_PAGES 1024 /* per view, allocated only when needed */
 
 static bool __read_mostly hbt_eptp_probe;
 module_param(hbt_eptp_probe, bool, 0444);
@@ -51,15 +52,30 @@ struct vmx_hbt_eptp {
 	bool tlb_valid;
 	int tlb_cpu;
 	bool live;
+	bool memslots;
+	u64 slots_generation;
+	u32 table_count[2];
 	struct page **pinned;
 	u32 pinned_count, map_count;
 	u64 ram_hva;
 	u32 ram_pages, data_count, data_limit;
 	u32 *data_pages;
-	u64 *live_pts[2][512];
 	struct kvm_hbt_eptp_live_map maps[KVM_HBT_EPTP_MAX_OVERLAYS];
 	void *map_pages[2][KVM_HBT_EPTP_MAX_OVERLAYS];
 };
+
+static void free_live_tables(u64 *table, unsigned int level)
+{
+	unsigned int i;
+
+	if (!table)
+		return;
+	if (level)
+		for (i = 0; i < 512; i++)
+			if (table[i])
+				free_live_tables(__va(table[i] & PAGE_MASK), level - 1);
+	free_page((unsigned long)table);
+}
 
 static void free_probe(struct vmx_hbt_eptp *p)
 {
@@ -72,8 +88,6 @@ static void free_probe(struct vmx_hbt_eptp *p)
 	kvfree(p->pinned);
 	kvfree(p->data_pages);
 	for (v = 0; v < 2; v++) {
-		for (i = 1; i < 512; i++)
-			free_page((unsigned long)p->live_pts[v][i]);
 		for (i = 0; i < p->map_count; i++)
 			free_page((unsigned long)p->map_pages[v][i]);
 	}
@@ -81,9 +95,13 @@ static void free_probe(struct vmx_hbt_eptp *p)
 		free_page((unsigned long)p->ram[i]);
 		free_page((unsigned long)p->overlays[i]);
 	}
-	for (v = 0; v < 2; v++)
-		for (l = 0; l < 4; l++)
-			free_page((unsigned long)p->tables[v][l]);
+	for (v = 0; v < 2; v++) {
+		if (p->live)
+			free_live_tables(p->tables[v][0], 3);
+		else
+			for (l = 0; l < 4; l++)
+				free_page((unsigned long)p->tables[v][l]);
+	}
 	free_page((unsigned long)p->list);
 	kvfree(p);
 }
@@ -218,16 +236,60 @@ fail:
 static int live_leaf(struct vmx_hbt_eptp *p, unsigned int view,
 		     unsigned int page, u64 value)
 {
-	unsigned int pt = page / 512;
+	u64 *table = p->tables[view][0];
+	unsigned int shift;
 
-	if (!p->live_pts[view][pt]) {
-		p->live_pts[view][pt] = (void *)get_zeroed_page(GFP_KERNEL_ACCOUNT);
-		if (!p->live_pts[view][pt])
-			return -ENOMEM;
-		p->tables[view][2][pt] = __pa(p->live_pts[view][pt]) | 7;
+	for (shift = 27; shift; shift -= 9) {
+		unsigned int index = (page >> shift) & 511;
+		u64 *next;
+
+		if (!table[index]) {
+			if (p->table_count[view] == HBT_LIVE_TABLE_MAX_PAGES)
+				return -ENOSPC;
+			next = (void *)get_zeroed_page(GFP_KERNEL_ACCOUNT);
+			if (!next)
+				return -ENOMEM;
+			table[index] = __pa(next) | 7;
+			p->table_count[view]++;
+		}
+		table = __va(table[index] & PAGE_MASK);
 	}
-	p->live_pts[view][pt][page % 512] = value;
+	table[page & 511] = value;
 	return 0;
+}
+
+static u64 live_slots_generation(struct kvm *kvm)
+{
+	int idx = srcu_read_lock(&kvm->srcu);
+	u64 generation = kvm_memslots(kvm)->generation;
+
+	srcu_read_unlock(&kvm->srcu, idx);
+	return generation;
+}
+
+static long live_pin(struct kvm_vcpu *vcpu, struct vmx_hbt_eptp *p,
+		     unsigned int gfn, struct page **page)
+{
+	unsigned long hva = p->ram_hva + (u64)gfn * PAGE_SIZE;
+	int idx = srcu_read_lock(&vcpu->kvm->srcu);
+	long ret;
+
+	if (p->memslots) {
+		if (p->slots_generation != kvm_memslots(vcpu->kvm)->generation) {
+			ret = -ESTALE;
+			goto out;
+		}
+		/* gfn_to_hva() requires a writable, valid slot. */
+		hva = gfn_to_hva(vcpu->kvm, gfn);
+		if (kvm_is_error_hva(hva)) {
+			ret = -EFAULT;
+			goto out;
+		}
+	}
+	ret = pin_user_pages_fast(hva, 1, FOLL_WRITE | FOLL_LONGTERM, page);
+out:
+	srcu_read_unlock(&vcpu->kvm->srcu, idx);
+	return ret;
 }
 
 /* Identical nonzero image pointers describe shared private backing. Each
@@ -256,7 +318,10 @@ static int configure_live(struct vcpu_vmx *vmx, struct kvm_hbt_eptp_probe *req)
 {
 	struct vmx_hbt_eptp *p;
 	struct vmx_hbt_eptp **old;
-	unsigned int i, j, v, l, data_limit = READ_ONCE(hbt_eptp_data_pages);
+	unsigned int i, j, v, data_limit = READ_ONCE(hbt_eptp_data_pages);
+	bool memslots = req->flags & KVM_HBT_EPTP_MEMSLOTS;
+	unsigned int max_pages = memslots ? KVM_HBT_EPTP_MEMSLOT_MAX_PAGES :
+		KVM_HBT_EPTP_LIVE_MAX_PAGES;
 	u64 *ram_leaves __free(kfree) = NULL;
 	long pinned;
 	int ret = -ENOMEM;
@@ -269,7 +334,8 @@ static int configure_live(struct vcpu_vmx *vmx, struct kvm_hbt_eptp_probe *req)
 	if (vmx->hbt_eptp)
 		return -EBUSY;
 	if (data_limit < 16 || data_limit > HBT_LAZY_DATA_MAX_PAGES ||
-	    !req->nr_pages || req->nr_pages > KVM_HBT_EPTP_LIVE_MAX_PAGES ||
+	    (memslots ? req->nr_pages || req->image_addr :
+	     !req->nr_pages || req->nr_pages > max_pages) ||
 	    req->nr_overlays > KVM_HBT_EPTP_MAX_OVERLAYS || req->view ||
 	    offset_in_page(req->image_addr) ||
 	    req->image_addr > ULONG_MAX - (u64)req->nr_pages * PAGE_SIZE)
@@ -281,11 +347,17 @@ static int configure_live(struct vcpu_vmx *vmx, struct kvm_hbt_eptp_probe *req)
 	if (!ram_leaves)
 		goto fail;
 	p->live = true;
+	p->memslots = memslots;
+	p->slots_generation = live_slots_generation(vmx->vcpu.kvm);
+	if (memslots && (p->slots_generation & KVM_MEMSLOT_GEN_UPDATE_IN_PROGRESS)) {
+		ret = -EAGAIN;
+		goto fail;
+	}
 	p->key = req->reserved[0];
 	p->ram_hva = req->image_addr;
-	p->ram_pages = req->nr_pages;
+	p->ram_pages = memslots ? max_pages : req->nr_pages;
 	p->map_count = req->nr_overlays;
-	p->data_limit = min(data_limit, req->nr_pages);
+	p->data_limit = min(data_limit, p->ram_pages);
 	if (copy_from_user(p->maps, u64_to_user_ptr(req->overlays_addr),
 			   p->map_count * sizeof(p->maps[0]))) {
 		ret = -EFAULT;
@@ -295,7 +367,7 @@ static int configure_live(struct vcpu_vmx *vmx, struct kvm_hbt_eptp_probe *req)
 		struct kvm_hbt_eptp_live_map *m = &p->maps[i];
 
 		ret = -EINVAL;
-		if (m->page >= KVM_HBT_EPTP_LIVE_MAX_PAGES || m->permissions & ~0x707U)
+		if (m->page >= max_pages || m->permissions & ~0x707U)
 			goto fail;
 		for (j = 0; j < i; j++)
 			if (p->maps[j].page == m->page)
@@ -305,7 +377,7 @@ static int configure_live(struct vcpu_vmx *vmx, struct kvm_hbt_eptp_probe *req)
 			u64 address = v ? m->helper_addr : m->normal_addr;
 
 			if (((perm & 2) && !(perm & 1)) ||
-			    (perm && !address && m->page >= req->nr_pages))
+			    (perm && !address && m->page >= p->ram_pages))
 				goto fail;
 		}
 	}
@@ -327,9 +399,7 @@ static int configure_live(struct vcpu_vmx *vmx, struct kvm_hbt_eptp_probe *req)
 		if (!((m->permissions & 7) && !m->normal_addr) &&
 		    !((m->permissions & 0x700) && !m->helper_addr))
 			continue;
-		pinned = pin_user_pages_fast(req->image_addr + (u64)m->page * PAGE_SIZE,
-					     1, FOLL_WRITE | FOLL_LONGTERM,
-					     &p->pinned[p->pinned_count]);
+		pinned = live_pin(&vmx->vcpu, p, m->page, &p->pinned[p->pinned_count]);
 		if (pinned != 1) {
 			ret = pinned < 0 ? pinned : -EFAULT;
 			goto fail;
@@ -342,16 +412,12 @@ static int configure_live(struct vcpu_vmx *vmx, struct kvm_hbt_eptp_probe *req)
 		goto fail;
 	}
 	for (v = 0; v < 2; v++) {
-		for (l = 0; l < 4; l++) {
-			p->tables[v][l] = (void *)get_zeroed_page(GFP_KERNEL_ACCOUNT);
-			if (!p->tables[v][l]) {
-				ret = -ENOMEM;
-				goto fail;
-			}
-			if (l)
-				p->tables[v][l - 1][0] = __pa(p->tables[v][l]) | 7;
+		p->tables[v][0] = (void *)get_zeroed_page(GFP_KERNEL_ACCOUNT);
+		if (!p->tables[v][0]) {
+			ret = -ENOMEM;
+			goto fail;
 		}
-		p->live_pts[v][0] = p->tables[v][3];
+		p->table_count[v] = 1;
 		p->list[v] = __pa(p->tables[v][0]) | VMX_EPTP_MT_WB | VMX_EPTP_PWL_4;
 		for (i = 0; i < p->map_count; i++) {
 			struct kvm_hbt_eptp_live_map *m = &p->maps[i];
@@ -390,7 +456,7 @@ fail:
 
 /* Add ordinary RAM as data only. Explicit overlays keep their permissions;
  * code writes and all instruction fetches still require canonical recovery.
- * The VMM's original LIVE_CONFIG image bounds every userspace pin.
+ * Pins are bounded by the original image or by validated KVM memory slots.
  */
 static int map_live_data(struct kvm_vcpu *vcpu, struct vmx_hbt_eptp *p,
 			 struct kvm_hbt_eptp_probe *req)
@@ -403,6 +469,8 @@ static int map_live_data(struct kvm_vcpu *vcpu, struct vmx_hbt_eptp *p,
 	if (!p || !p->live || page >= p->ram_pages || req->view ||
 	    req->image_addr || req->overlays_addr || req->nr_overlays)
 		return -EINVAL;
+	if (p->memslots && p->slots_generation != live_slots_generation(vcpu->kvm))
+		return -ESTALE;
 	for (i = 0; i < p->map_count; i++)
 		if (p->maps[i].page == page)
 			return -EPERM;
@@ -411,18 +479,22 @@ static int map_live_data(struct kvm_vcpu *vcpu, struct vmx_hbt_eptp *p,
 			return 0;
 	if (p->data_count == p->data_limit)
 		return -ENOSPC;
-	count = pin_user_pages_fast(p->ram_hva + (u64)page * PAGE_SIZE, 1,
-				   FOLL_WRITE | FOLL_LONGTERM, &pinned);
+	count = live_pin(vcpu, p, page, &pinned);
 	if (count != 1)
 		return count < 0 ? count : -EFAULT;
-	p->pinned[p->pinned_count++] = pinned;
-	p->data_pages[p->data_count++] = page;
 	p->tlb_valid = false;
 	for (i = 0; i < 2; i++) {
 		ret = live_leaf(p, i, page, page_to_phys(pinned) | 0x73);
-		if (ret)
+		if (ret) {
+			/* A partial mapping must never survive as a completed pin. */
+			while (i--)
+				live_leaf(p, i, page, 0);
+			unpin_user_page(pinned);
 			return ret;
+		}
 	}
+	p->pinned[p->pinned_count++] = pinned;
+	p->data_pages[p->data_count++] = page;
 	kvm_vcpu_srcu_read_lock(vcpu);
 	kvm_vcpu_mark_page_dirty(vcpu, page);
 	kvm_vcpu_srcu_read_unlock(vcpu);
@@ -523,6 +595,8 @@ static int resume_live(struct vcpu_vmx *vmx, struct vmx_hbt_eptp **slot,
 		return -EBUSY;
 	if (!p)
 		return -ENOENT;
+	if (p->memslots && p->slots_generation != live_slots_generation(vmx->vcpu.kvm))
+		return -ESTALE;
 	if (ranges) {
 		int ret = transfer_ranges(p, ranges, true);
 
@@ -591,7 +665,10 @@ long vmx_hbt_eptp_probe(struct kvm_vcpu *vcpu, void __user *argp)
 		return -EOPNOTSUPP;
 	if (copy_from_user(&req, argp, sizeof(req)))
 		return -EFAULT;
-	if (req.version != KVM_HBT_EPTP_VERSION || req.flags ||
+	if (req.version != KVM_HBT_EPTP_VERSION ||
+	    (req.flags && (req.flags != KVM_HBT_EPTP_MEMSLOTS ||
+	     (req.operation != KVM_HBT_EPTP_LIVE_CONFIG &&
+	      req.operation != KVM_HBT_EPTP_CACHE_CONFIG))) ||
 	    req.reserved[1] || req.reserved[2])
 		return -EINVAL;
 	if (req.operation != KVM_HBT_EPTP_RESUME_RANGES &&
@@ -614,7 +691,8 @@ long vmx_hbt_eptp_probe(struct kvm_vcpu *vcpu, void __user *argp)
 		req.flags = boot_cpu_has(X86_FEATURE_HYPERVISOR) ? KVM_HBT_EPTP_UNDER_HYPERVISOR : 0;
 		req.flags |= KVM_HBT_EPTP_SHARED_OVERLAY | KVM_HBT_EPTP_LAZY_DATA |
 			     KVM_HBT_EPTP_PERSISTENT | KVM_HBT_EPTP_CONTEXT_CACHE |
-			     KVM_HBT_EPTP_RANGE_IO | KVM_HBT_EPTP_CONTEXT_IO;
+			     KVM_HBT_EPTP_RANGE_IO | KVM_HBT_EPTP_CONTEXT_IO |
+			     KVM_HBT_EPTP_MEMSLOTS;
 		req.reserved[0] = KVM_HBT_EPTP_MAX_CONTEXTS;
 		return copy_to_user(argp, &req, sizeof(req)) ? -EFAULT : 0;
 	case KVM_HBT_EPTP_CONFIG:
@@ -703,7 +781,9 @@ bool vmx_hbt_eptp_pending_event(struct vcpu_vmx *vmx)
 	struct vmx_hbt_eptp *p = vmx->hbt_eptp;
 	u32 info = vmcs_read32(VM_ENTRY_INTR_INFO_FIELD);
 
-	if (!(info & INTR_INFO_VALID_MASK))
+	if (!(info & INTR_INFO_VALID_MASK) &&
+	    !(p->memslots && p->slots_generation !=
+	      live_slots_generation(vmx->vcpu.kvm)))
 		return false;
 	p->pending_event = true;
 	return true;

@@ -210,6 +210,7 @@ struct kvm_hbt_context {
 #define KVM_HBT_EPTP_CONTEXT_CACHE 16 /* QUERY: keyed operations; reserved[0] limit */
 #define KVM_HBT_EPTP_RANGE_IO 32 /* QUERY: READ_RANGES/RESUME_RANGES */
 #define KVM_HBT_EPTP_CONTEXT_IO 64 /* QUERY: batched GET/SET_CONTEXT */
+#define KVM_HBT_EPTP_MEMSLOTS 128 /* QUERY and LIVE/CACHE_CONFIG input flag */
 #define KVM_EXIT_HBT_EPTP 0x48425402
 
 struct kvm_hbt_eptp_overlay {
@@ -270,6 +271,15 @@ struct kvm_hbt_eptp_live_map {
 	__u64 helper_addr;
 };
 #define KVM_HBT_EPTP_LIVE_MAX_PAGES (1U << 18)
+/* MEMSLOTS config has image_addr=0 and nr_pages=0. Canonical RAM comes from
+ * writable KVM memory slots, including discontiguous high RAM; holes/MMIO
+ * cannot be pinned. Private overlays may occupy GPAs below 1 TiB. The legacy
+ * contiguous-image ABI above retains its original 1 GiB bounds.
+ * Slot generation changes force recovery before entry and reject resume with
+ * ESTALE. The VMM must rebuild the context against the new memory layout.
+ * EPT tables and data pins are allocated on demand, with independent bounds.
+ */
+#define KVM_HBT_EPTP_MEMSLOT_MAX_PAGES (1U << 28)
 
 struct kvm_hbt_eptp_probe {
 	__u32 version;
