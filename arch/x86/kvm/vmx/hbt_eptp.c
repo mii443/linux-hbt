@@ -233,8 +233,18 @@ fail:
 	return ret;
 }
 
-static int live_leaf(struct vmx_hbt_eptp *p, unsigned int view,
-		     unsigned int page, u64 value)
+struct live_table_link {
+	u64 *entry;
+	unsigned int view;
+};
+
+struct live_table_journal {
+	unsigned int count;
+	struct live_table_link links[];
+};
+
+static u64 *live_leaf_pointer(struct vmx_hbt_eptp *p, unsigned int view,
+			     unsigned int page, struct live_table_journal *journal)
 {
 	u64 *table = p->tables[view][0];
 	unsigned int shift;
@@ -245,16 +255,29 @@ static int live_leaf(struct vmx_hbt_eptp *p, unsigned int view,
 
 		if (!table[index]) {
 			if (p->table_count[view] == HBT_LIVE_TABLE_MAX_PAGES)
-				return -ENOSPC;
+				return ERR_PTR(-ENOSPC);
 			next = (void *)get_zeroed_page(GFP_KERNEL_ACCOUNT);
 			if (!next)
-				return -ENOMEM;
+				return ERR_PTR(-ENOMEM);
 			table[index] = __pa(next) | 7;
 			p->table_count[view]++;
+			if (journal)
+				journal->links[journal->count++] =
+					(struct live_table_link){ &table[index], view };
 		}
 		table = __va(table[index] & PAGE_MASK);
 	}
-	table[page & 511] = value;
+	return &table[page & 511];
+}
+
+static int live_leaf(struct vmx_hbt_eptp *p, unsigned int view,
+		     unsigned int page, u64 value)
+{
+	u64 *entry = live_leaf_pointer(p, view, page, NULL);
+
+	if (IS_ERR(entry))
+		return PTR_ERR(entry);
+	*entry = value;
 	return 0;
 }
 
@@ -295,13 +318,12 @@ out:
 /* Identical nonzero image pointers describe shared private backing. Each
  * mapping owns a page reference, so free_probe() handles aliases normally.
  */
-static void *live_overlay_copy(struct vmx_hbt_eptp *p, unsigned int view,
-			      unsigned int index, u64 address)
+static void *live_overlay_copy(struct vmx_hbt_eptp *p, u64 address)
 {
 	unsigned int v, i;
 
-	for (v = 0; v <= view; v++) {
-		for (i = 0; i < (v == view ? index : p->map_count); i++) {
+	for (v = 0; v < 2; v++) {
+		for (i = 0; i < p->map_count; i++) {
 			u64 prior = v ? p->maps[i].helper_addr : p->maps[i].normal_addr;
 			void *page = p->map_pages[v][i];
 
@@ -381,7 +403,7 @@ static int configure_live(struct vcpu_vmx *vmx, struct kvm_hbt_eptp_probe *req)
 				goto fail;
 		}
 	}
-	p->pinned = kvmalloc_array(p->map_count + p->data_limit,
+	p->pinned = kvmalloc_array(KVM_HBT_EPTP_MAX_OVERLAYS + p->data_limit,
 				   sizeof(*p->pinned), GFP_KERNEL_ACCOUNT);
 	p->data_pages = kvmalloc_array(p->data_limit, sizeof(*p->data_pages),
 				       GFP_KERNEL_ACCOUNT);
@@ -426,7 +448,7 @@ static int configure_live(struct vcpu_vmx *vmx, struct kvm_hbt_eptp_probe *req)
 			u64 value = 0;
 
 			if (perm && address) {
-				void *page = live_overlay_copy(p, v, i, address);
+				void *page = live_overlay_copy(p, address);
 
 				if (IS_ERR(page)) {
 					ret = PTR_ERR(page);
@@ -451,6 +473,151 @@ static int configure_live(struct vcpu_vmx *vmx, struct kvm_hbt_eptp_probe *req)
 	return 0;
 fail:
 	free_probe(p);
+	return ret;
+}
+
+/* Inactive-only transaction: prepare copies, pins and all EPT paths before
+ * changing any leaf. Roll back new paths in reverse allocation order, so even
+ * repeated failed appends cannot consume the bounded EPT table budget.
+ */
+static int append_live(struct vcpu_vmx *vmx, struct kvm_hbt_eptp_probe *req)
+{
+	struct vmx_hbt_eptp **slot = cached_context(vmx, req->reserved[0]);
+	struct vmx_hbt_eptp *p = slot ? *slot : NULL;
+	struct live_table_journal *journal __free(kfree) = NULL;
+	struct append_leaf {
+		u64 *entry[2], value[2], ram;
+		bool data;
+	} *leaves __free(kfree) = NULL;
+	unsigned int count = req->nr_overlays, first, pins, i, j, v, max_pages;
+	int ret = -ENOMEM;
+
+	if (vmx->hbt_eptp)
+		return -EBUSY;
+	if (!p || !p->live)
+		return -ENOENT;
+	if (req->view || req->nr_pages || req->image_addr || !count ||
+	    count > KVM_HBT_EPTP_MAX_OVERLAYS)
+		return -EINVAL;
+	if (count > KVM_HBT_EPTP_MAX_OVERLAYS - p->map_count)
+		return -ENOSPC;
+	if (p->memslots && p->slots_generation != live_slots_generation(vmx->vcpu.kvm))
+		return -ESTALE;
+	first = p->map_count;
+	pins = p->pinned_count;
+	max_pages = p->memslots ? KVM_HBT_EPTP_MEMSLOT_MAX_PAGES :
+		KVM_HBT_EPTP_LIVE_MAX_PAGES;
+	leaves = kcalloc(count, sizeof(*leaves), GFP_KERNEL_ACCOUNT);
+	journal = kzalloc(struct_size(journal, links, 6 * count), GFP_KERNEL_ACCOUNT);
+	if (!leaves || !journal)
+		return -ENOMEM;
+	if (copy_from_user(p->maps + first, u64_to_user_ptr(req->overlays_addr),
+			   count * sizeof(p->maps[0]))) {
+		ret = -EFAULT;
+		goto fail;
+	}
+	for (i = first; i < first + count; i++) {
+		struct kvm_hbt_eptp_live_map *m = &p->maps[i];
+
+		ret = -EINVAL;
+		if (m->page >= max_pages || m->permissions & ~0x707U)
+			goto fail;
+		for (j = 0; j < i; j++)
+			if (p->maps[j].page == m->page)
+				goto fail;
+		for (v = 0; v < 2; v++) {
+			unsigned int perm = (m->permissions >> (v * 8)) & 7;
+			u64 address = v ? m->helper_addr : m->normal_addr;
+
+			if (((perm & 2) && !(perm & 1)) ||
+			    (perm && !address && m->page >= p->ram_pages))
+				goto fail;
+		}
+	}
+	/* New copies may alias either view of any existing private image. */
+	p->map_count += count;
+	for (i = 0; i < count; i++) {
+		struct kvm_hbt_eptp_live_map *m = &p->maps[first + i];
+		bool canonical = ((m->permissions & 7) && !m->normal_addr) ||
+			((m->permissions & 0x700) && !m->helper_addr);
+
+		for (j = 0; j < p->data_count; j++)
+			if (p->data_pages[j] == m->page) {
+				leaves[i].data = true;
+				break;
+			}
+		for (v = 0; v < 2; v++) {
+			leaves[i].entry[v] = live_leaf_pointer(p, v, m->page, journal);
+			if (IS_ERR(leaves[i].entry[v])) {
+				ret = PTR_ERR(leaves[i].entry[v]);
+				goto fail;
+			}
+		}
+		if (leaves[i].data) {
+			/* Reuse its existing pin. A wholly private promotion also keeps
+			 * that pin until destruction, bounded by the explicit map count.
+			 */
+			leaves[i].ram = *leaves[i].entry[0] & PAGE_MASK;
+		} else if (canonical) {
+			long n = live_pin(&vmx->vcpu, p, m->page, &p->pinned[p->pinned_count]);
+
+			if (n != 1) {
+				ret = n < 0 ? n : -EFAULT;
+				goto fail;
+			}
+			leaves[i].ram = page_to_phys(p->pinned[p->pinned_count++]);
+		}
+		for (v = 0; v < 2; v++) {
+			unsigned int perm = (m->permissions >> (v * 8)) & 7;
+			u64 address = v ? m->helper_addr : m->normal_addr;
+
+			if (perm && address) {
+				void *page = live_overlay_copy(p, address);
+
+				if (IS_ERR(page)) {
+					ret = PTR_ERR(page);
+					goto fail;
+				}
+				p->map_pages[v][first + i] = page;
+				leaves[i].value[v] = __pa(page) | 0x70 | perm;
+			} else if (perm) {
+				leaves[i].value[v] = leaves[i].ram | 0x70 | perm;
+			}
+		}
+	}
+	if (p->memslots && p->slots_generation != live_slots_generation(vmx->vcpu.kvm)) {
+		ret = -ESTALE;
+		goto fail;
+	}
+	for (i = 0; i < count; i++) {
+		for (v = 0; v < 2; v++)
+			*leaves[i].entry[v] = leaves[i].value[v];
+		if (leaves[i].data)
+			for (j = 0; j < p->data_count; j++)
+				if (p->data_pages[j] == p->maps[first + i].page) {
+					p->data_pages[j] = p->data_pages[--p->data_count];
+					break;
+				}
+	}
+	p->tlb_valid = false;
+	return 0;
+fail:
+	while (journal->count) {
+		struct live_table_link *link = &journal->links[--journal->count];
+
+		free_page((unsigned long)__va(*link->entry & PAGE_MASK));
+		*link->entry = 0;
+		p->table_count[link->view]--;
+	}
+	for (v = 0; v < 2; v++)
+		for (i = first; i < first + count; i++) {
+			free_page((unsigned long)p->map_pages[v][i]);
+			p->map_pages[v][i] = NULL;
+		}
+	unpin_user_pages(p->pinned + pins, p->pinned_count - pins);
+	p->pinned_count = pins;
+	p->map_count = first;
+	memset(p->maps + first, 0, count * sizeof(p->maps[0]));
 	return ret;
 }
 
@@ -643,6 +810,10 @@ static int resume_live(struct vcpu_vmx *vmx, struct vmx_hbt_eptp **slot,
 	kvm_vcpu_srcu_read_lock(&vmx->vcpu);
 	for (i = 0; i < p->data_count; i++)
 		kvm_vcpu_mark_page_dirty(&vmx->vcpu, p->data_pages[i]);
+	for (i = 0; i < p->map_count; i++)
+		if (((p->maps[i].permissions & 2) && !p->maps[i].normal_addr) ||
+		    ((p->maps[i].permissions & 0x200) && !p->maps[i].helper_addr))
+			kvm_vcpu_mark_page_dirty(&vmx->vcpu, p->maps[i].page);
 	kvm_vcpu_srcu_read_unlock(&vmx->vcpu);
 	*slot = NULL;
 	vmx->hbt_eptp = p;
@@ -672,8 +843,9 @@ long vmx_hbt_eptp_probe(struct kvm_vcpu *vcpu, void __user *argp)
 	    req.reserved[1] || req.reserved[2])
 		return -EINVAL;
 	if (req.operation != KVM_HBT_EPTP_RESUME_RANGES &&
-	    (req.operation >= KVM_HBT_EPTP_CACHE_CONFIG &&
-	    req.operation <= KVM_HBT_EPTP_CACHE_DROP ? !req.reserved[0] : req.reserved[0])
+	    ((req.operation >= KVM_HBT_EPTP_CACHE_CONFIG &&
+	      req.operation <= KVM_HBT_EPTP_CACHE_DROP) ||
+	      req.operation == KVM_HBT_EPTP_CACHE_APPEND ? !req.reserved[0] : req.reserved[0])
 	   )
 		return -EINVAL;
 	vmx = to_vmx(vcpu);
@@ -692,7 +864,7 @@ long vmx_hbt_eptp_probe(struct kvm_vcpu *vcpu, void __user *argp)
 		req.flags |= KVM_HBT_EPTP_SHARED_OVERLAY | KVM_HBT_EPTP_LAZY_DATA |
 			     KVM_HBT_EPTP_PERSISTENT | KVM_HBT_EPTP_CONTEXT_CACHE |
 			     KVM_HBT_EPTP_RANGE_IO | KVM_HBT_EPTP_CONTEXT_IO |
-			     KVM_HBT_EPTP_MEMSLOTS;
+			     KVM_HBT_EPTP_MEMSLOTS | KVM_HBT_EPTP_INCREMENTAL;
 		req.reserved[0] = KVM_HBT_EPTP_MAX_CONTEXTS;
 		return copy_to_user(argp, &req, sizeof(req)) ? -EFAULT : 0;
 	case KVM_HBT_EPTP_CONFIG:
@@ -700,6 +872,8 @@ long vmx_hbt_eptp_probe(struct kvm_vcpu *vcpu, void __user *argp)
 	case KVM_HBT_EPTP_LIVE_CONFIG:
 	case KVM_HBT_EPTP_CACHE_CONFIG:
 		return configure_live(vmx, &req);
+	case KVM_HBT_EPTP_CACHE_APPEND:
+		return append_live(vmx, &req);
 	case KVM_HBT_EPTP_MAP_DATA:
 		return map_live_data(vcpu, p, &req);
 	case KVM_HBT_EPTP_READ_MAPS:

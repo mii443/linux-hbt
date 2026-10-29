@@ -200,6 +200,7 @@ struct kvm_hbt_context {
 #define KVM_HBT_EPTP_CACHE_DROP 11 /* discard an inactive reserved[0] key */
 #define KVM_HBT_EPTP_READ_RANGES 12 /* bounded private reads; returns active view */
 #define KVM_HBT_EPTP_RESUME_RANGES 13 /* refresh ranges; optional reserved[0] key */
+#define KVM_HBT_EPTP_CACHE_APPEND 14 /* append maps to an inactive reserved[0] key */
 #define KVM_HBT_EPTP_MAX_CONTEXTS 64
 #define KVM_HBT_EPTP_MAX_PAGES 512
 #define KVM_HBT_EPTP_MAX_OVERLAYS 512
@@ -211,6 +212,7 @@ struct kvm_hbt_context {
 #define KVM_HBT_EPTP_RANGE_IO 32 /* QUERY: READ_RANGES/RESUME_RANGES */
 #define KVM_HBT_EPTP_CONTEXT_IO 64 /* QUERY: batched GET/SET_CONTEXT */
 #define KVM_HBT_EPTP_MEMSLOTS 128 /* QUERY and LIVE/CACHE_CONFIG input flag */
+#define KVM_HBT_EPTP_INCREMENTAL 256 /* QUERY: transactional CACHE_APPEND */
 #define KVM_EXIT_HBT_EPTP 0x48425402
 
 struct kvm_hbt_eptp_overlay {
@@ -263,6 +265,14 @@ struct kvm_hbt_eptp_range {
  * eviction. Failed refresh leaves the selected context inactive and retryable.
  * CACHE_DROP rejects active keys; DESTROY releases all keyed and legacy views.
  * QUERY reports MAX_CONTEXTS in reserved[0] (input must still be zero).
+ * CACHE_APPEND supplies 1..MAX_OVERLAYS live_map descriptors for a parked key;
+ * other inputs are zero. Existing explicit GPAs cannot be replaced. Lazy data
+ * GPAs may become explicit mappings with the requested permissions. Existing
+ * private images, unrelated data leaves and pins are retained. Image pointer
+ * aliases share existing backing, without refreshing it. The total explicit
+ * map budget is unchanged. Failure leaves the old mappings/data budget intact;
+ * success remains inactive and still requires validated RESUME[_RANGES].
+ * Memslot generation changes reject append just as they reject resume.
  */
 struct kvm_hbt_eptp_live_map {
 	__u32 page;
