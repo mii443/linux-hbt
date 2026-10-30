@@ -17,6 +17,7 @@
 #include "x86_ops.h"
 #include "tdx.h"
 #include "../irq.h"
+#include "../lapic.h"
 #include "../x86.h"
 #include "../smm.h"
 
@@ -1210,15 +1211,17 @@ void vmx_hbt_eptp_enter(struct vcpu_vmx *vmx)
 	p->saved_secondary = secondary_exec_controls_get(vmx);
 	p->saved_exceptions = vmcs_read32(EXCEPTION_BITMAP);
 	if (p->live) {
-		/* At most 100 us of guest execution before a checkpoint. This timer
-		 * belongs to the private slice, not to the guest's LAPIC timer.
-		 */
+		u32 slice = max_t(u32, 1, (tsc_khz / 10) >>
+				vmx_misc_preemption_timer_rate(vmcs_config.misc));
+
+		/* Share the hardware timer with KVM's LAPIC deadline and immediate
+		 * exit requests. A private slice must never postpone either one. */
 		p->saved_pin = pin_controls_get(vmx);
 		p->saved_timer = vmcs_read32(VMX_PREEMPTION_TIMER_VALUE);
+		if (p->saved_pin & PIN_BASED_VMX_PREEMPTION_TIMER)
+			slice = min(slice, p->saved_timer);
 		pin_controls_set(vmx, p->saved_pin | PIN_BASED_VMX_PREEMPTION_TIMER);
-		vmcs_write32(VMX_PREEMPTION_TIMER_VALUE,
-			max_t(u32, 1, (tsc_khz / 10) >>
-			      vmx_misc_preemption_timer_rate(vmcs_config.misc)));
+		vmcs_write32(VMX_PREEMPTION_TIMER_VALUE, slice);
 	}
 	/* New objects start invalid. Refreshes and leaf changes invalidate them;
 	 * movement to another CPU always flushes there, including a return to a
@@ -1262,6 +1265,7 @@ int vmx_hbt_eptp_exit(struct vcpu_vmx *vmx)
 {
 	struct kvm_vcpu *vcpu = &vmx->vcpu;
 	struct kvm_run *run = vcpu->run;
+	bool timer_pending = false;
 
 	if (vmx->hbt_eptp->pending_event) {
 		vmx->hbt_eptp->pending_event = false;
@@ -1284,6 +1288,14 @@ int vmx_hbt_eptp_exit(struct vcpu_vmx *vmx)
 		return 0;
 	}
 	vmx->hbt_eptp->entered = false;
+	/* HBT bypasses the ordinary VMX timer fast path. Account for an expired
+	 * guest deadline here, even when another exit won the race. Queue the IRQ
+	 * through KVM, then require canonical recovery before guest injection. */
+	if (vmx->hbt_eptp->live && vmx->hv_deadline_tsc != -1 &&
+	    rdtsc_ordered() >= vmx->hv_deadline_tsc) {
+		kvm_lapic_expired_hv_timer(vcpu);
+		timer_pending = true;
+	}
 	run->exit_reason = KVM_EXIT_HBT_EPTP;
 	run->internal.suberror = vmx_get_exit_reason(vcpu).full;
 	run->internal.ndata = 7;
@@ -1292,7 +1304,7 @@ int vmx_hbt_eptp_exit(struct vcpu_vmx *vmx)
 	run->internal.data[2] = vmcs_read32(VM_EXIT_INSTRUCTION_LEN);
 	run->internal.data[3] = vmcs_read32(VM_EXIT_INTR_INFO);
 	run->internal.data[4] = kvm_rip_read(vcpu);
-	run->internal.data[5] = 0; /* pending injections return before hardware entry */
+	run->internal.data[5] = timer_pending;
 	run->internal.data[6] = vmx_get_exit_reason(vcpu).basic == EXIT_REASON_EPT_VIOLATION ?
 		vmcs_read64(GUEST_PHYSICAL_ADDRESS) : 0;
 	return 0;
