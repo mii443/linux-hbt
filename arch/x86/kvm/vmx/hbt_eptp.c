@@ -559,7 +559,13 @@ static int append_live(struct vcpu_vmx *vmx, struct kvm_hbt_eptp_probe *req)
 			 */
 			leaves[i].ram = *leaves[i].entry[0] & PAGE_MASK;
 		} else if (canonical) {
-			long n = live_pin(&vmx->vcpu, p, m->page, &p->pinned[p->pinned_count]);
+			long n;
+
+			if (p->pinned_count == KVM_HBT_EPTP_MAX_OVERLAYS + p->data_limit) {
+				ret = -ENOSPC;
+				goto fail;
+			}
+			n = live_pin(&vmx->vcpu, p, m->page, &p->pinned[p->pinned_count]);
 
 			if (n != 1) {
 				ret = n < 0 ? n : -EFAULT;
@@ -621,6 +627,205 @@ fail:
 	return ret;
 }
 
+/* Replace private images without discarding learned data mappings or EPT
+ * paths. The old parked context remains usable on every failure path. */
+static int update_live(struct vcpu_vmx *vmx, struct kvm_hbt_eptp_probe *req)
+{
+	struct vmx_hbt_eptp **slot = cached_context(vmx, req->reserved[0]);
+	struct vmx_hbt_eptp *p = slot ? *slot : NULL, *next = NULL;
+	struct live_table_journal *journal __free(kfree) = NULL;
+	struct update_leaf {
+		u64 *entry[2], value[2], ram;
+		int old;
+		bool data;
+	} *leaves __free(kfree) = NULL;
+	unsigned int count = req->nr_overlays, pins, i, j, v, max_pages;
+	int ret = -ENOMEM;
+
+	if (vmx->hbt_eptp)
+		return -EBUSY;
+	if (!p || !p->live)
+		return -ENOENT;
+	if (req->view || req->nr_pages || req->image_addr ||
+	    count < p->map_count || count > KVM_HBT_EPTP_MAX_OVERLAYS || !count)
+		return -EINVAL;
+	if (p->memslots && p->slots_generation != live_slots_generation(vmx->vcpu.kvm))
+		return -ESTALE;
+	pins = p->pinned_count;
+	max_pages = p->memslots ? KVM_HBT_EPTP_MEMSLOT_MAX_PAGES :
+		KVM_HBT_EPTP_LIVE_MAX_PAGES;
+	next = kvzalloc_obj(*next, GFP_KERNEL_ACCOUNT);
+	leaves = kcalloc(count, sizeof(*leaves), GFP_KERNEL_ACCOUNT);
+	journal = kzalloc(struct_size(journal, links, 6 * count), GFP_KERNEL_ACCOUNT);
+	if (!next || !leaves || !journal)
+		goto fail;
+	next->map_count = count;
+	if (copy_from_user(next->maps, u64_to_user_ptr(req->overlays_addr),
+			   count * sizeof(next->maps[0]))) {
+		ret = -EFAULT;
+		goto fail;
+	}
+	for (i = 0; i < count; i++) {
+		struct kvm_hbt_eptp_live_map *m = next->maps + i;
+
+		ret = -EINVAL;
+		if (m->page >= max_pages || m->permissions &
+		    ~(0x707U | KVM_HBT_EPTP_KEEP_NORMAL | KVM_HBT_EPTP_KEEP_HELPER))
+			goto fail;
+		for (j = 0; j < i; j++)
+			if (next->maps[j].page == m->page)
+				goto fail;
+		leaves[i].old = -1;
+		for (j = 0; j < p->map_count; j++)
+			if (p->maps[j].page == m->page)
+				leaves[i].old = j;
+		for (v = 0; v < 2; v++) {
+			unsigned int perm = (m->permissions >> (v * 8)) & 7;
+			u64 address = v ? m->helper_addr : m->normal_addr;
+			bool keep = m->permissions & (KVM_HBT_EPTP_KEEP_NORMAL << v);
+			int old = leaves[i].old;
+
+			if (((perm & 2) && !(perm & 1)) ||
+			    (perm && !address && m->page >= p->ram_pages))
+				goto fail;
+			if (keep && (!perm || !address || old < 0 ||
+			    !p->map_pages[v][old] ||
+			    perm != ((p->maps[old].permissions >> (v * 8)) & 7)))
+				goto fail;
+		}
+	}
+	/* Updates may promote or reorder mappings but never silently drop one. */
+	for (j = 0; j < p->map_count; j++) {
+		for (i = 0; i < count && leaves[i].old != j; i++)
+			;
+		if (i == count)
+			goto fail;
+	}
+	for (i = 0; i < count; i++) {
+		struct kvm_hbt_eptp_live_map *m = next->maps + i;
+		bool canonical = ((m->permissions & 7) && !m->normal_addr) ||
+			((m->permissions & 0x700) && !m->helper_addr);
+
+		for (v = 0; v < 2; v++) {
+			leaves[i].entry[v] = live_leaf_pointer(p, v, m->page, journal);
+			if (IS_ERR(leaves[i].entry[v])) {
+				ret = PTR_ERR(leaves[i].entry[v]);
+				goto fail;
+			}
+		}
+		for (j = 0; j < p->data_count; j++)
+			if (p->data_pages[j] == m->page) {
+				leaves[i].data = true;
+				leaves[i].ram = *leaves[i].entry[0] & PAGE_MASK;
+				break;
+			}
+		if (canonical && leaves[i].old >= 0) {
+			struct kvm_hbt_eptp_live_map *old = p->maps + leaves[i].old;
+
+			for (v = 0; v < 2; v++)
+				if (((old->permissions >> (v * 8)) & 7) &&
+				    !(v ? old->helper_addr : old->normal_addr))
+					leaves[i].ram = *leaves[i].entry[v] & PAGE_MASK;
+		}
+		if (canonical && !leaves[i].ram) {
+			long n;
+
+			/* Old promotion pins are retained until context destruction. */
+			if (p->pinned_count == KVM_HBT_EPTP_MAX_OVERLAYS + p->data_limit) {
+				ret = -ENOSPC;
+				goto fail;
+			}
+			n = live_pin(&vmx->vcpu, p, m->page, &p->pinned[p->pinned_count]);
+			if (n != 1) {
+				ret = n < 0 ? n : -EFAULT;
+				goto fail;
+			}
+			leaves[i].ram = page_to_phys(p->pinned[p->pinned_count++]);
+		}
+		for (v = 0; v < 2; v++) {
+			unsigned int perm = (m->permissions >> (v * 8)) & 7;
+			u64 address = v ? m->helper_addr : m->normal_addr;
+			bool keep = m->permissions & (KVM_HBT_EPTP_KEEP_NORMAL << v);
+			void *page = NULL;
+
+			if (perm && address) {
+				if (keep) {
+					page = p->map_pages[v][leaves[i].old];
+					get_page(virt_to_page(page));
+				} else {
+					page = live_overlay_copy(next, address);
+					if (IS_ERR(page)) {
+						ret = PTR_ERR(page);
+						goto fail;
+					}
+				}
+				next->map_pages[v][i] = page;
+				leaves[i].value[v] = __pa(page) | 0x70 | perm;
+			} else if (perm) {
+				leaves[i].value[v] = leaves[i].ram | 0x70 | perm;
+			}
+		}
+	}
+	/* Retaining one view and copying a new alias of it would be ambiguous.
+	 * Check exact pointer/backing identity before committing any EPT leaf. */
+	for (i = 0; i < count; i++)
+		for (v = 0; v < 2; v++) {
+			u64 address = v ? next->maps[i].helper_addr : next->maps[i].normal_addr;
+			unsigned int pv;
+
+			if (!next->map_pages[v][i])
+				continue;
+			for (j = 0; j <= i; j++)
+				for (pv = 0; pv < 2; pv++)
+					if (next->map_pages[pv][j] &&
+					    address == (pv ? next->maps[j].helper_addr : next->maps[j].normal_addr) &&
+					    (next->map_pages[v][i] != next->map_pages[pv][j] ||
+					     !!(next->maps[i].permissions & (KVM_HBT_EPTP_KEEP_NORMAL << v)) !=
+					     !!(next->maps[j].permissions & (KVM_HBT_EPTP_KEEP_NORMAL << pv)))) {
+						ret = -EINVAL;
+						goto fail;
+					}
+		}
+	if (p->memslots && p->slots_generation != live_slots_generation(vmx->vcpu.kvm)) {
+		ret = -ESTALE;
+		goto fail;
+	}
+	for (i = 0; i < count; i++) {
+		for (v = 0; v < 2; v++)
+			*leaves[i].entry[v] = leaves[i].value[v];
+		if (leaves[i].data)
+			for (j = 0; j < p->data_count; j++)
+				if (p->data_pages[j] == next->maps[i].page) {
+					p->data_pages[j] = p->data_pages[--p->data_count];
+					break;
+				}
+		next->maps[i].permissions &= 0x707;
+	}
+	for (v = 0; v < 2; v++)
+		for (i = 0; i < p->map_count; i++)
+			free_page((unsigned long)p->map_pages[v][i]);
+	memcpy(p->maps, next->maps, sizeof(p->maps));
+	memcpy(p->map_pages, next->map_pages, sizeof(p->map_pages));
+	p->map_count = count;
+	p->tlb_valid = false;
+	next->map_count = 0;
+	free_probe(next);
+	return 0;
+fail:
+	if (journal)
+		while (journal->count) {
+			struct live_table_link *link = &journal->links[--journal->count];
+
+			free_page((unsigned long)__va(*link->entry & PAGE_MASK));
+			*link->entry = 0;
+			p->table_count[link->view]--;
+		}
+	unpin_user_pages(p->pinned + pins, p->pinned_count - pins);
+	p->pinned_count = pins;
+	free_probe(next);
+	return ret;
+}
+
 /* Add ordinary RAM as data only. Explicit overlays keep their permissions;
  * code writes and all instruction fetches still require canonical recovery.
  * Pins are bounded by the original image or by validated KVM memory slots.
@@ -644,7 +849,8 @@ static int map_live_data(struct kvm_vcpu *vcpu, struct vmx_hbt_eptp *p,
 	for (i = 0; i < p->data_count; i++)
 		if (p->data_pages[i] == page)
 			return 0;
-	if (p->data_count == p->data_limit)
+	if (p->data_count == p->data_limit ||
+	    p->pinned_count == KVM_HBT_EPTP_MAX_OVERLAYS + p->data_limit)
 		return -ENOSPC;
 	count = live_pin(vcpu, p, page, &pinned);
 	if (count != 1)
@@ -845,7 +1051,8 @@ long vmx_hbt_eptp_probe(struct kvm_vcpu *vcpu, void __user *argp)
 	if (req.operation != KVM_HBT_EPTP_RESUME_RANGES &&
 	    ((req.operation >= KVM_HBT_EPTP_CACHE_CONFIG &&
 	      req.operation <= KVM_HBT_EPTP_CACHE_DROP) ||
-	      req.operation == KVM_HBT_EPTP_CACHE_APPEND ? !req.reserved[0] : req.reserved[0])
+	      (req.operation == KVM_HBT_EPTP_CACHE_APPEND ||
+	       req.operation == KVM_HBT_EPTP_CACHE_UPDATE) ? !req.reserved[0] : req.reserved[0])
 	   )
 		return -EINVAL;
 	vmx = to_vmx(vcpu);
@@ -864,7 +1071,8 @@ long vmx_hbt_eptp_probe(struct kvm_vcpu *vcpu, void __user *argp)
 		req.flags |= KVM_HBT_EPTP_SHARED_OVERLAY | KVM_HBT_EPTP_LAZY_DATA |
 			     KVM_HBT_EPTP_PERSISTENT | KVM_HBT_EPTP_CONTEXT_CACHE |
 			     KVM_HBT_EPTP_RANGE_IO | KVM_HBT_EPTP_CONTEXT_IO |
-			     KVM_HBT_EPTP_MEMSLOTS | KVM_HBT_EPTP_INCREMENTAL;
+			     KVM_HBT_EPTP_MEMSLOTS | KVM_HBT_EPTP_INCREMENTAL |
+			     KVM_HBT_EPTP_UPDATE;
 		req.reserved[0] = KVM_HBT_EPTP_MAX_CONTEXTS;
 		return copy_to_user(argp, &req, sizeof(req)) ? -EFAULT : 0;
 	case KVM_HBT_EPTP_CONFIG:
@@ -874,6 +1082,8 @@ long vmx_hbt_eptp_probe(struct kvm_vcpu *vcpu, void __user *argp)
 		return configure_live(vmx, &req);
 	case KVM_HBT_EPTP_CACHE_APPEND:
 		return append_live(vmx, &req);
+	case KVM_HBT_EPTP_CACHE_UPDATE:
+		return update_live(vmx, &req);
 	case KVM_HBT_EPTP_MAP_DATA:
 		return map_live_data(vcpu, p, &req);
 	case KVM_HBT_EPTP_READ_MAPS:
