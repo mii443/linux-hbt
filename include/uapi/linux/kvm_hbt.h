@@ -202,6 +202,7 @@ struct kvm_hbt_context {
 #define KVM_HBT_EPTP_RESUME_RANGES 13 /* refresh ranges; optional reserved[0] key */
 #define KVM_HBT_EPTP_CACHE_APPEND 14 /* append maps to an inactive reserved[0] key */
 #define KVM_HBT_EPTP_CACHE_UPDATE 15 /* replace/extend maps of an inactive key */
+#define KVM_HBT_EPTP_READ_STEP 16 /* one native instruction with original code-page data */
 #define KVM_HBT_EPTP_MAX_CONTEXTS 64
 #define KVM_HBT_EPTP_MAX_PAGES 512
 #define KVM_HBT_EPTP_MAX_OVERLAYS 512
@@ -215,6 +216,9 @@ struct kvm_hbt_context {
 #define KVM_HBT_EPTP_MEMSLOTS 128 /* QUERY and LIVE/CACHE_CONFIG input flag */
 #define KVM_HBT_EPTP_INCREMENTAL 256 /* QUERY: transactional CACHE_APPEND */
 #define KVM_HBT_EPTP_UPDATE 512 /* QUERY: transactional CACHE_UPDATE */
+#define KVM_HBT_EPTP_NATIVE_READ 1024 /* QUERY: bounded READ_STEP with MTF rollback */
+/* A non-MTF exit during READ_STEP has ndata=8, data[7]=1 (alias restored).
+ * Recover normally instead of alternating aliases on a split operand. */
 #define KVM_HBT_EPTP_KEEP_NORMAL (1U << 16)
 #define KVM_HBT_EPTP_KEEP_HELPER (1U << 17)
 #define KVM_EXIT_HBT_EPTP 0x48425402

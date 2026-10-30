@@ -49,6 +49,10 @@ struct vmx_hbt_eptp {
 	u64 saved_eptp, saved_function, saved_list;
 	u32 saved_secondary, saved_exceptions;
 	u32 saved_pin, saved_timer;
+	u32 saved_primary;
+	u64 *read_step_leaf, read_step_saved;
+	struct page *read_step_page;
+	bool read_step_exit;
 	bool entered;
 	bool pending_event;
 	bool tlb_valid;
@@ -89,12 +93,27 @@ static void free_live_tables(u64 *table, unsigned int level)
 	free_page((unsigned long)table);
 }
 
+/* The canonical alias is permitted for at most one hardware instruction.
+ * Restore on EVERY exit/cancellation, including failed entry and exceptions.
+ * No guest data or architectural register is emulated or changed here. */
+static void cancel_read_step(struct vmx_hbt_eptp *p)
+{
+	if (!p->read_step_leaf)
+		return;
+	*p->read_step_leaf = p->read_step_saved;
+	p->read_step_leaf = NULL;
+	p->tlb_valid = false;
+	unpin_user_page(p->read_step_page);
+	p->read_step_page = NULL;
+}
+
 static void free_probe(struct vmx_hbt_eptp *p)
 {
 	unsigned int v, l, i;
 
 	if (!p)
 		return;
+	cancel_read_step(p);
 	if (p->pinned_count)
 		unpin_user_pages_dirty_lock(p->pinned, p->pinned_count, true);
 	kvfree(p->pinned);
@@ -901,6 +920,52 @@ static int map_live_data(struct kvm_vcpu *vcpu, struct vmx_hbt_eptp *p,
 	return 0;
 }
 
+/* Userspace has verified a canonical instruction boundary (no helper scratch
+ * registers). Only the exact faulting execute-only overlay can be relaxed.
+ * Its canonical RAM, never the patched image, supplies both reads and fetches
+ * until MTF. A write remains prohibited. The next exit restores the overlay. */
+static int read_step(struct vcpu_vmx *vmx, struct kvm_hbt_eptp_probe *req)
+{
+	struct kvm_vcpu *vcpu = &vmx->vcpu;
+	struct vmx_hbt_eptp *p = vmx->hbt_eptp;
+	unsigned int page = req->nr_pages, at, perm;
+	struct page *pinned;
+	u64 *leaf;
+	long ret;
+
+	if (!p || !p->live || p->entered || p->read_step_leaf ||
+	    req->view || req->image_addr || req->overlays_addr || req->nr_overlays ||
+	    page >= p->ram_pages)
+		return -EINVAL;
+	if (!(vmcs_config.cpu_based_exec_ctrl & CPU_BASED_MONITOR_TRAP_FLAG) ||
+	    (exec_controls_get(vmx) & CPU_BASED_MONITOR_TRAP_FLAG) || vcpu->guest_debug)
+		return -EOPNOTSUPP;
+	if (p->pending_event || vmx->fail || vmx_get_exit_reason(vcpu).failed_vmentry ||
+	    vmx_get_exit_reason(vcpu).basic != EXIT_REASON_EPT_VIOLATION ||
+	    (vmcs_readl(EXIT_QUALIFICATION) & 7) != 1 ||
+	    (vmcs_read64(GUEST_PHYSICAL_ADDRESS) >> PAGE_SHIFT) != page)
+		return -EPERM;
+	at = *live_map_slot(p->maps, p->map_index, page);
+	if (!at)
+		return -ENOENT;
+	perm = (p->maps[at - 1].permissions >> (p->view * 8)) & 7;
+	if (perm != 4 || !p->map_pages[p->view][at - 1])
+		return -EPERM;
+	leaf = live_leaf_pointer(p, p->view, page, NULL);
+	if (IS_ERR(leaf))
+		return PTR_ERR(leaf);
+	ret = live_pin(vcpu, p, page, &pinned);
+	if (ret != 1)
+		return ret < 0 ? ret : -EFAULT;
+	p->read_step_leaf = leaf;
+	p->read_step_saved = *leaf;
+	p->read_step_page = pinned;
+	p->read_step_exit = false;
+	*leaf = page_to_phys(pinned) | 0x75; /* WB, ignore PAT, read/execute only */
+	p->tlb_valid = false;
+	return 0;
+}
+
 static int read_maps(struct vmx_hbt_eptp *p, struct kvm_hbt_eptp_probe *req)
 {
 	struct kvm_hbt_eptp_overlay *maps __free(kfree) = NULL;
@@ -1101,6 +1166,8 @@ long vmx_hbt_eptp_probe(struct kvm_vcpu *vcpu, void __user *argp)
 			     KVM_HBT_EPTP_RANGE_IO | KVM_HBT_EPTP_CONTEXT_IO |
 			     KVM_HBT_EPTP_MEMSLOTS | KVM_HBT_EPTP_INCREMENTAL |
 			     KVM_HBT_EPTP_UPDATE;
+		if (vmcs_config.cpu_based_exec_ctrl & CPU_BASED_MONITOR_TRAP_FLAG)
+			req.flags |= KVM_HBT_EPTP_NATIVE_READ;
 		req.reserved[0] = KVM_HBT_EPTP_MAX_CONTEXTS;
 		return copy_to_user(argp, &req, sizeof(req)) ? -EFAULT : 0;
 	case KVM_HBT_EPTP_CONFIG:
@@ -1114,6 +1181,8 @@ long vmx_hbt_eptp_probe(struct kvm_vcpu *vcpu, void __user *argp)
 		return update_live(vmx, &req);
 	case KVM_HBT_EPTP_MAP_DATA:
 		return map_live_data(vcpu, p, &req);
+	case KVM_HBT_EPTP_READ_STEP:
+		return read_step(vmx, &req);
 	case KVM_HBT_EPTP_READ_MAPS:
 		return read_maps(p, &req);
 	case KVM_HBT_EPTP_READ_RANGES:
@@ -1147,6 +1216,7 @@ long vmx_hbt_eptp_probe(struct kvm_vcpu *vcpu, void __user *argp)
 			return -EINVAL;
 		if (!p || !p->live || p->entered)
 			return -EBUSY;
+		cancel_read_step(p);
 		if (p->key) {
 			park_context(vmx, p);
 		} else {
@@ -1198,6 +1268,7 @@ bool vmx_hbt_eptp_pending_event(struct vcpu_vmx *vmx)
 	      live_slots_generation(vmx->vcpu.kvm)))
 		return false;
 	p->pending_event = true;
+	cancel_read_step(p);
 	return true;
 }
 
@@ -1209,6 +1280,7 @@ void vmx_hbt_eptp_enter(struct vcpu_vmx *vmx)
 	p->saved_function = vmcs_read64(VM_FUNCTION_CONTROL);
 	p->saved_list = vmcs_read64(EPTP_LIST_ADDRESS);
 	p->saved_secondary = secondary_exec_controls_get(vmx);
+	p->saved_primary = exec_controls_get(vmx);
 	p->saved_exceptions = vmcs_read32(EXCEPTION_BITMAP);
 	if (p->live) {
 		u32 slice = max_t(u32, 1, (tsc_khz / 10) >>
@@ -1241,6 +1313,8 @@ void vmx_hbt_eptp_enter(struct vcpu_vmx *vmx)
 	vmcs_write32(EXCEPTION_BITMAP, ~0U);
 	secondary_exec_controls_set(vmx, (p->saved_secondary | SECONDARY_EXEC_ENABLE_VMFUNC) &
 				    ~(SECONDARY_EXEC_ENABLE_PML | SECONDARY_EXEC_EPT_VIOLATION_VE));
+	if (p->read_step_leaf)
+		exec_controls_set(vmx, p->saved_primary | CPU_BASED_MONITOR_TRAP_FLAG);
 	p->entered = true;
 }
 
@@ -1250,6 +1324,11 @@ void vmx_hbt_eptp_leave(struct vcpu_vmx *vmx)
 	u64 active = vmcs_read64(EPT_POINTER);
 
 	p->view = active == p->list[1];
+	p->read_step_exit = !!p->read_step_leaf;
+	if (p->read_step_leaf) {
+		exec_controls_set(vmx, p->saved_primary);
+		cancel_read_step(p);
+	}
 	if (p->live) {
 		pin_controls_set(vmx, p->saved_pin);
 		vmcs_write32(VMX_PREEMPTION_TIMER_VALUE, p->saved_timer);
@@ -1266,6 +1345,9 @@ int vmx_hbt_eptp_exit(struct vcpu_vmx *vmx)
 	struct kvm_vcpu *vcpu = &vmx->vcpu;
 	struct kvm_run *run = vcpu->run;
 	bool timer_pending = false;
+	bool stepped = vmx->hbt_eptp->read_step_exit;
+
+	vmx->hbt_eptp->read_step_exit = false;
 
 	if (vmx->hbt_eptp->pending_event) {
 		vmx->hbt_eptp->pending_event = false;
@@ -1296,6 +1378,9 @@ int vmx_hbt_eptp_exit(struct vcpu_vmx *vmx)
 		kvm_lapic_expired_hv_timer(vcpu);
 		timer_pending = true;
 	}
+	if (stepped && !timer_pending &&
+	    vmx_get_exit_reason(vcpu).basic == EXIT_REASON_MONITOR_TRAP_FLAG)
+		return 1;
 	run->exit_reason = KVM_EXIT_HBT_EPTP;
 	run->internal.suberror = vmx_get_exit_reason(vcpu).full;
 	run->internal.ndata = 7;
@@ -1307,5 +1392,11 @@ int vmx_hbt_eptp_exit(struct vcpu_vmx *vmx)
 	run->internal.data[5] = timer_pending;
 	run->internal.data[6] = vmx_get_exit_reason(vcpu).basic == EXIT_REASON_EPT_VIOLATION ?
 		vmcs_read64(GUEST_PHYSICAL_ADDRESS) : 0;
+	/* A split read may fault on a second execute-only page. Tell userspace
+	 * that this step was rolled back so it does not ping-pong the two aliases. */
+	if (stepped) {
+		run->internal.ndata = 8;
+		run->internal.data[7] = 1;
+	}
 	return 0;
 }
