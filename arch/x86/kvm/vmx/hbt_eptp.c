@@ -66,6 +66,7 @@ struct vmx_hbt_eptp {
 	u64 ram_hva;
 	u32 ram_pages, data_count, data_limit;
 	u32 *data_pages;
+	u32 native_count, native_pages[HBT_LAZY_DATA_MAX_PAGES];
 	struct kvm_hbt_eptp_live_map maps[KVM_HBT_EPTP_MAX_OVERLAYS];
 	u16 map_index[1024];
 	void *map_pages[2][KVM_HBT_EPTP_MAX_OVERLAYS];
@@ -310,6 +311,28 @@ static int live_leaf(struct vmx_hbt_eptp *p, unsigned int view,
 		return PTR_ERR(entry);
 	*entry = value;
 	return 0;
+}
+
+/* These canonical execution leaves do not depend on copied guest PTEs.
+ * Revoke them before any canonical interval can unmap/reuse a user page,
+ * change privilege state, or repurpose that GPA as kernel code. Retained
+ * private contexts must relearn them after resuming. Data pinning remains. */
+static void revoke_native_pages(struct vmx_hbt_eptp *p)
+{
+	unsigned int i, v;
+
+	if (!p->native_count)
+		return;
+	for (i = 0; i < p->native_count; i++)
+		for (v = 0; v < 2; v++) {
+			u64 *leaf = live_leaf_pointer(p, v, p->native_pages[i], NULL);
+
+			/* Both leaves were installed successfully before publication. */
+			if (!WARN_ON_ONCE(IS_ERR(leaf)))
+				*leaf &= ~4ULL;
+		}
+	p->native_count = 0;
+	p->tlb_valid = false;
 }
 
 static u64 live_slots_generation(struct kvm *kvm)
@@ -966,6 +989,43 @@ static int read_step(struct vcpu_vmx *vmx, struct kvm_hbt_eptp_probe *req)
 	return 0;
 }
 
+static int map_native(struct vcpu_vmx *vmx, struct kvm_hbt_eptp_probe *req)
+{
+	struct kvm_vcpu *vcpu = &vmx->vcpu;
+	struct vmx_hbt_eptp *p = vmx->hbt_eptp;
+	u64 *leaf[2];
+	unsigned int v;
+	int ret;
+
+	if (!p || !p->live || p->entered || p->read_step_leaf || p->pending_event)
+		return -EBUSY;
+	if (vmx->fail || vmx_get_exit_reason(vcpu).failed_vmentry ||
+	    vmx_get_exit_reason(vcpu).basic != EXIT_REASON_EPT_VIOLATION ||
+	    (vmcs_readl(EXIT_QUALIFICATION) & 7) != 4 ||
+	    (vmcs_read64(GUEST_PHYSICAL_ADDRESS) >> PAGE_SHIFT) != req->nr_pages ||
+	    vmx_get_cpl_no_cache(vcpu) != 3)
+		return -EPERM;
+	if (p->native_count == ARRAY_SIZE(p->native_pages))
+		return -ENOSPC;
+	/* Same bounded, dirty-tracked canonical backing as ordinary data. Never
+	 * override an explicit code/PTE/gate overlay or a readonly/MMIO slot. */
+	ret = map_live_data(vcpu, p, req);
+	if (ret)
+		return ret;
+	for (v = 0; v < 2; v++) {
+		leaf[v] = live_leaf_pointer(p, v, req->nr_pages, NULL);
+		if (IS_ERR(leaf[v]))
+			return PTR_ERR(leaf[v]);
+	}
+	if ((*leaf[0] & 4) && (*leaf[1] & 4))
+		return 0;
+	for (v = 0; v < 2; v++)
+		*leaf[v] |= 4;
+	p->native_pages[p->native_count++] = req->nr_pages;
+	p->tlb_valid = false;
+	return 0;
+}
+
 static int read_maps(struct vmx_hbt_eptp *p, struct kvm_hbt_eptp_probe *req)
 {
 	struct kvm_hbt_eptp_overlay *maps __free(kfree) = NULL;
@@ -1165,7 +1225,7 @@ long vmx_hbt_eptp_probe(struct kvm_vcpu *vcpu, void __user *argp)
 			     KVM_HBT_EPTP_PERSISTENT | KVM_HBT_EPTP_CONTEXT_CACHE |
 			     KVM_HBT_EPTP_RANGE_IO | KVM_HBT_EPTP_CONTEXT_IO |
 			     KVM_HBT_EPTP_MEMSLOTS | KVM_HBT_EPTP_INCREMENTAL |
-			     KVM_HBT_EPTP_UPDATE;
+			     KVM_HBT_EPTP_UPDATE | KVM_HBT_EPTP_NATIVE_FETCH;
 		if (vmcs_config.cpu_based_exec_ctrl & CPU_BASED_MONITOR_TRAP_FLAG)
 			req.flags |= KVM_HBT_EPTP_NATIVE_READ;
 		req.reserved[0] = KVM_HBT_EPTP_MAX_CONTEXTS;
@@ -1183,6 +1243,8 @@ long vmx_hbt_eptp_probe(struct kvm_vcpu *vcpu, void __user *argp)
 		return map_live_data(vcpu, p, &req);
 	case KVM_HBT_EPTP_READ_STEP:
 		return read_step(vmx, &req);
+	case KVM_HBT_EPTP_MAP_NATIVE:
+		return map_native(vmx, &req);
 	case KVM_HBT_EPTP_READ_MAPS:
 		return read_maps(p, &req);
 	case KVM_HBT_EPTP_READ_RANGES:
@@ -1217,6 +1279,7 @@ long vmx_hbt_eptp_probe(struct kvm_vcpu *vcpu, void __user *argp)
 		if (!p || !p->live || p->entered)
 			return -EBUSY;
 		cancel_read_step(p);
+		revoke_native_pages(p);
 		if (p->key) {
 			park_context(vmx, p);
 		} else {
