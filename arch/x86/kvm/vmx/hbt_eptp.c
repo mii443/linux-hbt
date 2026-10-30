@@ -7,6 +7,7 @@
  * This is a single-vCPU experiment with bounded overlays and pinned data.
  */
 #include <linux/moduleparam.h>
+#include <linux/hash.h>
 #include <linux/mm.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
@@ -627,6 +628,32 @@ fail:
 	return ret;
 }
 
+/* Bounded, build-local indexes. Values are one-based descriptor/view indices;
+ * no hash collision can substitute a different GPA or userspace address. */
+static u16 *update_map_slot(struct kvm_hbt_eptp_live_map *maps, u16 *index, u32 page)
+{
+	unsigned int at = hash_32(page, 10);
+
+	while (index[at] && maps[index[at] - 1].page != page)
+		at = (at + 1) & 1023;
+	return index + at;
+}
+
+static u16 *update_image_slot(struct vmx_hbt_eptp *p, u16 *index, u64 address)
+{
+	unsigned int at = hash_64(address, 11);
+
+	while (index[at]) {
+		unsigned int key = index[at] - 1;
+		struct kvm_hbt_eptp_live_map *m = p->maps + key / 2;
+
+		if (address == (key & 1 ? m->helper_addr : m->normal_addr))
+			break;
+		at = (at + 1) & 2047;
+	}
+	return index + at;
+}
+
 /* Replace private images without discarding learned data mappings or EPT
  * paths. The old parked context remains usable on every failure path. */
 static int update_live(struct vcpu_vmx *vmx, struct kvm_hbt_eptp_probe *req)
@@ -634,12 +661,13 @@ static int update_live(struct vcpu_vmx *vmx, struct kvm_hbt_eptp_probe *req)
 	struct vmx_hbt_eptp **slot = cached_context(vmx, req->reserved[0]);
 	struct vmx_hbt_eptp *p = slot ? *slot : NULL, *next = NULL;
 	struct live_table_journal *journal __free(kfree) = NULL;
+	u16 *indexes __free(kfree) = NULL;
 	struct update_leaf {
 		u64 *entry[2], value[2], ram;
 		int old;
 		bool data;
 	} *leaves __free(kfree) = NULL;
-	unsigned int count = req->nr_overlays, pins, i, j, v, max_pages;
+	unsigned int count = req->nr_overlays, pins, i, j, v, max_pages, matched = 0;
 	int ret = -ENOMEM;
 
 	if (vmx->hbt_eptp)
@@ -657,7 +685,8 @@ static int update_live(struct vcpu_vmx *vmx, struct kvm_hbt_eptp_probe *req)
 	next = kvzalloc_obj(*next, GFP_KERNEL_ACCOUNT);
 	leaves = kcalloc(count, sizeof(*leaves), GFP_KERNEL_ACCOUNT);
 	journal = kzalloc(struct_size(journal, links, 6 * count), GFP_KERNEL_ACCOUNT);
-	if (!next || !leaves || !journal)
+	indexes = kcalloc(4096, sizeof(*indexes), GFP_KERNEL_ACCOUNT);
+	if (!next || !leaves || !journal || !indexes)
 		goto fail;
 	next->map_count = count;
 	if (copy_from_user(next->maps, u64_to_user_ptr(req->overlays_addr),
@@ -665,20 +694,22 @@ static int update_live(struct vcpu_vmx *vmx, struct kvm_hbt_eptp_probe *req)
 		ret = -EFAULT;
 		goto fail;
 	}
+	for (i = 0; i < p->map_count; i++)
+		*update_map_slot(p->maps, indexes, p->maps[i].page) = i + 1;
 	for (i = 0; i < count; i++) {
 		struct kvm_hbt_eptp_live_map *m = next->maps + i;
+		u16 *at;
 
 		ret = -EINVAL;
 		if (m->page >= max_pages || m->permissions &
 		    ~(0x707U | KVM_HBT_EPTP_KEEP_NORMAL | KVM_HBT_EPTP_KEEP_HELPER))
 			goto fail;
-		for (j = 0; j < i; j++)
-			if (next->maps[j].page == m->page)
-				goto fail;
-		leaves[i].old = -1;
-		for (j = 0; j < p->map_count; j++)
-			if (p->maps[j].page == m->page)
-				leaves[i].old = j;
+		at = update_map_slot(next->maps, indexes + 1024, m->page);
+		if (*at)
+			goto fail;
+		*at = i + 1;
+		leaves[i].old = (int)*update_map_slot(p->maps, indexes, m->page) - 1;
+		matched += leaves[i].old >= 0;
 		for (v = 0; v < 2; v++) {
 			unsigned int perm = (m->permissions >> (v * 8)) & 7;
 			u64 address = v ? m->helper_addr : m->normal_addr;
@@ -695,12 +726,8 @@ static int update_live(struct vcpu_vmx *vmx, struct kvm_hbt_eptp_probe *req)
 		}
 	}
 	/* Updates may promote or reorder mappings but never silently drop one. */
-	for (j = 0; j < p->map_count; j++) {
-		for (i = 0; i < count && leaves[i].old != j; i++)
-			;
-		if (i == count)
-			goto fail;
-	}
+	if (matched != p->map_count)
+		goto fail;
 	for (i = 0; i < count; i++) {
 		struct kvm_hbt_eptp_live_map *m = next->maps + i;
 		bool canonical = ((m->permissions & 7) && !m->normal_addr) ||
@@ -713,7 +740,7 @@ static int update_live(struct vcpu_vmx *vmx, struct kvm_hbt_eptp_probe *req)
 				goto fail;
 			}
 		}
-		for (j = 0; j < p->data_count; j++)
+		for (j = 0; leaves[i].old < 0 && j < p->data_count; j++)
 			if (p->data_pages[j] == m->page) {
 				leaves[i].data = true;
 				leaves[i].ram = *leaves[i].entry[0] & PAGE_MASK;
@@ -749,16 +776,31 @@ static int update_live(struct vcpu_vmx *vmx, struct kvm_hbt_eptp_probe *req)
 			void *page = NULL;
 
 			if (perm && address) {
-				if (keep) {
+				u16 *at = update_image_slot(next, indexes + 2048, address);
+
+				if (*at) {
+					unsigned int key = *at - 1, pi = key / 2, pv = key & 1;
+					bool prior_keep = next->maps[pi].permissions &
+						(KVM_HBT_EPTP_KEEP_NORMAL << pv);
+
+					page = next->map_pages[pv][pi];
+					if (keep != prior_keep ||
+					    (keep && page != p->map_pages[v][leaves[i].old])) {
+						ret = -EINVAL;
+						goto fail;
+					}
+					get_page(virt_to_page(page));
+				} else if (keep) {
 					page = p->map_pages[v][leaves[i].old];
 					get_page(virt_to_page(page));
 				} else {
-					page = live_overlay_copy(next, address);
+					page = copy_page_from_user(address);
 					if (IS_ERR(page)) {
 						ret = PTR_ERR(page);
 						goto fail;
 					}
 				}
+				*at = 1 + i * 2 + v;
 				next->map_pages[v][i] = page;
 				leaves[i].value[v] = __pa(page) | 0x70 | perm;
 			} else if (perm) {
@@ -766,26 +808,6 @@ static int update_live(struct vcpu_vmx *vmx, struct kvm_hbt_eptp_probe *req)
 			}
 		}
 	}
-	/* Retaining one view and copying a new alias of it would be ambiguous.
-	 * Check exact pointer/backing identity before committing any EPT leaf. */
-	for (i = 0; i < count; i++)
-		for (v = 0; v < 2; v++) {
-			u64 address = v ? next->maps[i].helper_addr : next->maps[i].normal_addr;
-			unsigned int pv;
-
-			if (!next->map_pages[v][i])
-				continue;
-			for (j = 0; j <= i; j++)
-				for (pv = 0; pv < 2; pv++)
-					if (next->map_pages[pv][j] &&
-					    address == (pv ? next->maps[j].helper_addr : next->maps[j].normal_addr) &&
-					    (next->map_pages[v][i] != next->map_pages[pv][j] ||
-					     !!(next->maps[i].permissions & (KVM_HBT_EPTP_KEEP_NORMAL << v)) !=
-					     !!(next->maps[j].permissions & (KVM_HBT_EPTP_KEEP_NORMAL << pv)))) {
-						ret = -EINVAL;
-						goto fail;
-					}
-		}
 	if (p->memslots && p->slots_generation != live_slots_generation(vmx->vcpu.kvm)) {
 		ret = -ESTALE;
 		goto fail;
