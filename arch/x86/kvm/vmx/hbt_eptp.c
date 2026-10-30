@@ -59,6 +59,9 @@ struct vmx_hbt_eptp {
 	int tlb_cpu;
 	bool live;
 	bool memslots;
+	u32 fast_flags, exclude_count;
+	struct kvm_hbt_eptp_exclude *excludes;
+	u64 fast_data, fast_native, fast_timer;
 	u64 slots_generation;
 	u32 table_count[2];
 	struct page **pinned;
@@ -115,6 +118,7 @@ static void free_probe(struct vmx_hbt_eptp *p)
 	if (!p)
 		return;
 	cancel_read_step(p);
+	kfree(p->excludes);
 	if (p->pinned_count)
 		unpin_user_pages_dirty_lock(p->pinned, p->pinned_count, true);
 	kvfree(p->pinned);
@@ -663,6 +667,7 @@ static int append_live(struct vcpu_vmx *vmx, struct kvm_hbt_eptp_probe *req)
 				}
 	}
 	p->tlb_valid = false;
+	p->fast_flags = 0;
 	return 0;
 fail:
 	while (journal->count) {
@@ -878,6 +883,7 @@ static int update_live(struct vcpu_vmx *vmx, struct kvm_hbt_eptp_probe *req)
 	memcpy(p->map_pages, next->map_pages, sizeof(p->map_pages));
 	p->map_count = count;
 	p->tlb_valid = false;
+	p->fast_flags = 0;
 	next->map_count = 0;
 	free_probe(next);
 	return 0;
@@ -906,7 +912,7 @@ static int map_live_data(struct kvm_vcpu *vcpu, struct vmx_hbt_eptp *p,
 	unsigned int page = req->nr_pages, i;
 	struct page *pinned;
 	long count;
-	int ret;
+	int ret, idx;
 
 	if (!p || !p->live || page >= p->ram_pages || req->view ||
 	    req->image_addr || req->overlays_addr || req->nr_overlays)
@@ -937,9 +943,11 @@ static int map_live_data(struct kvm_vcpu *vcpu, struct vmx_hbt_eptp *p,
 	}
 	p->pinned[p->pinned_count++] = pinned;
 	p->data_pages[p->data_count++] = page;
-	kvm_vcpu_srcu_read_lock(vcpu);
+	/* Also called inside KVM_RUN. A local SRCU index must not overwrite the
+	 * surrounding run loop's vcpu->srcu_idx. */
+	idx = srcu_read_lock(&vcpu->kvm->srcu);
 	kvm_vcpu_mark_page_dirty(vcpu, page);
-	kvm_vcpu_srcu_read_unlock(vcpu);
+	srcu_read_unlock(&vcpu->kvm->srcu, idx);
 	return 0;
 }
 
@@ -1024,6 +1032,72 @@ static int map_native(struct vcpu_vmx *vmx, struct kvm_hbt_eptp_probe *req)
 	p->native_pages[p->native_count++] = req->nr_pages;
 	p->tlb_valid = false;
 	return 0;
+}
+
+static int configure_fast(struct vmx_hbt_eptp *p, struct kvm_hbt_eptp_probe *req)
+{
+	struct kvm_hbt_eptp_exclude *ranges = NULL;
+	unsigned int i;
+
+	if (!p || !p->live || p->entered || p->read_step_leaf)
+		return -EBUSY;
+	if (req->view || req->nr_pages || req->image_addr ||
+	    req->nr_overlays > KVM_HBT_EPTP_MAX_OVERLAYS ||
+	    (!req->nr_overlays && req->overlays_addr) ||
+	    (!(req->flags & KVM_HBT_EPTP_FAST_NATIVE) &&
+	     (req->nr_overlays || (req->flags & KVM_HBT_EPTP_FAST_RESIDENT))))
+		return -EINVAL;
+	if (req->nr_overlays) {
+		ranges = memdup_array_user(u64_to_user_ptr(req->overlays_addr),
+					 req->nr_overlays, sizeof(*ranges));
+		if (IS_ERR(ranges))
+			return PTR_ERR(ranges);
+		for (i = 0; i < req->nr_overlays; i++)
+			if (ranges[i].start >= ranges[i].end ||
+			    ranges[i].end > BIT_ULL(47) ||
+			    (i && ranges[i - 1].end > ranges[i].start)) {
+				kfree(ranges);
+				return -EINVAL;
+			}
+	}
+	/* Publish only after every descriptor was copied and validated. */
+	kfree(p->excludes);
+	p->excludes = ranges;
+	p->exclude_count = req->nr_overlays;
+	p->fast_flags = req->flags;
+	return 0;
+}
+
+static bool fast_native_pc(struct vmx_hbt_eptp *p, u64 rip)
+{
+	unsigned int lo = 0, hi = p->exclude_count;
+
+	if (rip >= BIT_ULL(47) ||
+	    (p->view && !(p->fast_flags & KVM_HBT_EPTP_FAST_RESIDENT)))
+		return false;
+	while (lo < hi) {
+		unsigned int mid = lo + (hi - lo) / 2;
+
+		if (rip < p->excludes[mid].start)
+			hi = mid;
+		else if (rip >= p->excludes[mid].end)
+			lo = mid + 1;
+		else
+			return false;
+	}
+	return true;
+}
+
+static void report_fast(struct vmx_hbt_eptp *p, struct kvm_run *run, bool stepped)
+{
+	if (!p->fast_flags)
+		return;
+	run->internal.ndata = 11;
+	run->internal.data[7] = stepped;
+	run->internal.data[8] = p->fast_data;
+	run->internal.data[9] = p->fast_native;
+	run->internal.data[10] = p->fast_timer;
+	p->fast_data = p->fast_native = p->fast_timer = 0;
 }
 
 static int read_maps(struct vmx_hbt_eptp *p, struct kvm_hbt_eptp_probe *req)
@@ -1196,9 +1270,12 @@ long vmx_hbt_eptp_probe(struct kvm_vcpu *vcpu, void __user *argp)
 	if (copy_from_user(&req, argp, sizeof(req)))
 		return -EFAULT;
 	if (req.version != KVM_HBT_EPTP_VERSION ||
-	    (req.flags && (req.flags != KVM_HBT_EPTP_MEMSLOTS ||
+	    (req.operation == KVM_HBT_EPTP_FAST_CONFIG ?
+	     req.flags & ~(KVM_HBT_EPTP_FAST_DATA | KVM_HBT_EPTP_FAST_NATIVE |
+			   KVM_HBT_EPTP_FAST_TIMER | KVM_HBT_EPTP_FAST_RESIDENT) :
+	     (req.flags && (req.flags != KVM_HBT_EPTP_MEMSLOTS ||
 	     (req.operation != KVM_HBT_EPTP_LIVE_CONFIG &&
-	      req.operation != KVM_HBT_EPTP_CACHE_CONFIG))) ||
+	      req.operation != KVM_HBT_EPTP_CACHE_CONFIG)))) ||
 	    req.reserved[1] || req.reserved[2])
 		return -EINVAL;
 	if (req.operation != KVM_HBT_EPTP_RESUME_RANGES &&
@@ -1225,7 +1302,8 @@ long vmx_hbt_eptp_probe(struct kvm_vcpu *vcpu, void __user *argp)
 			     KVM_HBT_EPTP_PERSISTENT | KVM_HBT_EPTP_CONTEXT_CACHE |
 			     KVM_HBT_EPTP_RANGE_IO | KVM_HBT_EPTP_CONTEXT_IO |
 			     KVM_HBT_EPTP_MEMSLOTS | KVM_HBT_EPTP_INCREMENTAL |
-			     KVM_HBT_EPTP_UPDATE | KVM_HBT_EPTP_NATIVE_FETCH;
+			     KVM_HBT_EPTP_UPDATE | KVM_HBT_EPTP_NATIVE_FETCH |
+			     KVM_HBT_EPTP_FAST_RETRY;
 		if (vmcs_config.cpu_based_exec_ctrl & CPU_BASED_MONITOR_TRAP_FLAG)
 			req.flags |= KVM_HBT_EPTP_NATIVE_READ;
 		req.reserved[0] = KVM_HBT_EPTP_MAX_CONTEXTS;
@@ -1245,6 +1323,8 @@ long vmx_hbt_eptp_probe(struct kvm_vcpu *vcpu, void __user *argp)
 		return read_step(vmx, &req);
 	case KVM_HBT_EPTP_MAP_NATIVE:
 		return map_native(vmx, &req);
+	case KVM_HBT_EPTP_FAST_CONFIG:
+		return configure_fast(p, &req);
 	case KVM_HBT_EPTP_READ_MAPS:
 		return read_maps(p, &req);
 	case KVM_HBT_EPTP_READ_RANGES:
@@ -1407,6 +1487,7 @@ int vmx_hbt_eptp_exit(struct vcpu_vmx *vmx)
 {
 	struct kvm_vcpu *vcpu = &vmx->vcpu;
 	struct kvm_run *run = vcpu->run;
+	struct vmx_hbt_eptp *p = vmx->hbt_eptp;
 	bool timer_pending = false;
 	bool stepped = vmx->hbt_eptp->read_step_exit;
 
@@ -1424,6 +1505,7 @@ int vmx_hbt_eptp_exit(struct vcpu_vmx *vmx)
 		run->internal.data[4] = kvm_rip_read(vcpu);
 		run->internal.data[5] = 1;
 		run->internal.data[6] = 0;
+		report_fast(p, run, stepped);
 		return 0;
 	}
 	if (!vmx->hbt_eptp->entered || vmx->fail || vmx_get_exit_reason(vcpu).failed_vmentry) {
@@ -1444,6 +1526,37 @@ int vmx_hbt_eptp_exit(struct vcpu_vmx *vmx)
 	if (stepped && !timer_pending &&
 	    vmx_get_exit_reason(vcpu).basic == EXIT_REASON_MONITOR_TRAP_FLAG)
 		return 1;
+	/* These are permission-only retries. No architectural state is borrowed
+	 * by the kernel, and ordinary KVM request/event handling runs before the
+	 * next entry. A failed/unsupported mapping takes the existing recovery
+	 * exit, with the original RIP and qualification intact. */
+	if (!timer_pending && !stepped && p->fast_flags) {
+		unsigned int reason = vmx_get_exit_reason(vcpu).basic;
+		unsigned int access = vmcs_readl(EXIT_QUALIFICATION) & 7;
+		u64 page = vmcs_read64(GUEST_PHYSICAL_ADDRESS) >> PAGE_SHIFT;
+		struct kvm_hbt_eptp_probe req = {
+			.nr_pages = page,
+		};
+
+		if (reason == EXIT_REASON_PREEMPTION_TIMER &&
+		    (p->fast_flags & KVM_HBT_EPTP_FAST_TIMER)) {
+			p->fast_timer++;
+			return 1;
+		}
+		if (reason == EXIT_REASON_EPT_VIOLATION && page < p->ram_pages &&
+		    !(access & 4) && (access & 3) &&
+		    (p->fast_flags & KVM_HBT_EPTP_FAST_DATA) &&
+		    !map_live_data(vcpu, p, &req)) {
+			p->fast_data++;
+			return 1;
+		}
+		if (reason == EXIT_REASON_EPT_VIOLATION && page < p->ram_pages && access == 4 &&
+		    (p->fast_flags & KVM_HBT_EPTP_FAST_NATIVE) &&
+		    fast_native_pc(p, kvm_rip_read(vcpu)) && !map_native(vmx, &req)) {
+			p->fast_native++;
+			return 1;
+		}
+	}
 	run->exit_reason = KVM_EXIT_HBT_EPTP;
 	run->internal.suberror = vmx_get_exit_reason(vcpu).full;
 	run->internal.ndata = 7;
@@ -1461,5 +1574,6 @@ int vmx_hbt_eptp_exit(struct vcpu_vmx *vmx)
 		run->internal.ndata = 8;
 		run->internal.data[7] = 1;
 	}
+	report_fast(p, run, stepped);
 	return 0;
 }

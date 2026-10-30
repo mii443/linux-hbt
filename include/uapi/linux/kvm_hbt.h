@@ -204,6 +204,7 @@ struct kvm_hbt_context {
 #define KVM_HBT_EPTP_CACHE_UPDATE 15 /* replace/extend maps of an inactive key */
 #define KVM_HBT_EPTP_READ_STEP 16 /* one native instruction with original code-page data */
 #define KVM_HBT_EPTP_MAP_NATIVE 17 /* temporary CPL3 canonical RAM execution */
+#define KVM_HBT_EPTP_FAST_CONFIG 18 /* opt-in kernel retry of ordinary faults */
 #define KVM_HBT_EPTP_MAX_CONTEXTS 64
 #define KVM_HBT_EPTP_MAX_PAGES 512
 #define KVM_HBT_EPTP_MAX_OVERLAYS 512
@@ -219,6 +220,26 @@ struct kvm_hbt_context {
 #define KVM_HBT_EPTP_UPDATE 512 /* QUERY: transactional CACHE_UPDATE */
 #define KVM_HBT_EPTP_NATIVE_READ 1024 /* QUERY: bounded READ_STEP with MTF rollback */
 #define KVM_HBT_EPTP_NATIVE_FETCH 2048 /* QUERY: MAP_NATIVE, revoked by SUSPEND */
+#define KVM_HBT_EPTP_FAST_RETRY 4096 /* QUERY: FAST_CONFIG and exit data[8..10] */
+/* FAST_CONFIG configures the active, stopped context. flags selects the paths;
+ * overlays_addr/nr_overlays supplies sorted, disjoint [start,end) guest linear
+ * ranges containing generated code (at most MAX_OVERLAYS). Other inputs are
+ * zero. These ranges MUST include every helper, relay, gate and generated
+ * block: NATIVE may only retry a canonical PC outside them. RESIDENT also
+ * permits canonical PCs in view 1. DATA preserves explicit overlay protection.
+ * No instruction is emulated. Pending events, kernel fetches and failed maps
+ * still require userspace recovery. APPEND/UPDATE disables these paths;
+ * SUSPEND retains the policy but revokes temporary native execute permission.
+ * Enabled contexts return ndata=11: data[7] is READ_STEP rollback, data[8..10]
+ * counts data/native/timer retries since the preceding userspace HBT exit.
+ */
+#define KVM_HBT_EPTP_FAST_DATA 1U
+#define KVM_HBT_EPTP_FAST_NATIVE 2U
+#define KVM_HBT_EPTP_FAST_TIMER 4U
+#define KVM_HBT_EPTP_FAST_RESIDENT 8U
+struct kvm_hbt_eptp_exclude {
+	__u64 start, end;
+};
 /* A non-MTF exit during READ_STEP has ndata=8, data[7]=1 (alias restored).
  * Recover normally instead of alternating aliases on a split operand. */
 #define KVM_HBT_EPTP_KEEP_NORMAL (1U << 16)
