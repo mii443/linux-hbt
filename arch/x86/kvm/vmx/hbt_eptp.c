@@ -62,8 +62,18 @@ struct vmx_hbt_eptp {
 	u32 ram_pages, data_count, data_limit;
 	u32 *data_pages;
 	struct kvm_hbt_eptp_live_map maps[KVM_HBT_EPTP_MAX_OVERLAYS];
+	u16 map_index[1024];
 	void *map_pages[2][KVM_HBT_EPTP_MAX_OVERLAYS];
 };
+
+static u16 *live_map_slot(struct kvm_hbt_eptp_live_map *maps, u16 *index, u32 page)
+{
+	unsigned int at = hash_32(page, 10);
+
+	while (index[at] && maps[index[at] - 1].page != page)
+		at = (at + 1) & 1023;
+	return index + at;
+}
 
 static void free_live_tables(u64 *table, unsigned int level)
 {
@@ -341,7 +351,7 @@ static int configure_live(struct vcpu_vmx *vmx, struct kvm_hbt_eptp_probe *req)
 {
 	struct vmx_hbt_eptp *p;
 	struct vmx_hbt_eptp **old;
-	unsigned int i, j, v, data_limit = READ_ONCE(hbt_eptp_data_pages);
+	unsigned int i, v, data_limit = READ_ONCE(hbt_eptp_data_pages);
 	bool memslots = req->flags & KVM_HBT_EPTP_MEMSLOTS;
 	unsigned int max_pages = memslots ? KVM_HBT_EPTP_MEMSLOT_MAX_PAGES :
 		KVM_HBT_EPTP_LIVE_MAX_PAGES;
@@ -388,13 +398,15 @@ static int configure_live(struct vcpu_vmx *vmx, struct kvm_hbt_eptp_probe *req)
 	}
 	for (i = 0; i < p->map_count; i++) {
 		struct kvm_hbt_eptp_live_map *m = &p->maps[i];
+		u16 *at;
 
 		ret = -EINVAL;
 		if (m->page >= max_pages || m->permissions & ~0x707U)
 			goto fail;
-		for (j = 0; j < i; j++)
-			if (p->maps[j].page == m->page)
-				goto fail;
+		at = live_map_slot(p->maps, p->map_index, m->page);
+		if (*at)
+			goto fail;
+		*at = i + 1;
 		for (v = 0; v < 2; v++) {
 			unsigned int perm = (m->permissions >> (v * 8)) & 7;
 			u64 address = v ? m->helper_addr : m->normal_addr;
@@ -597,6 +609,7 @@ static int append_live(struct vcpu_vmx *vmx, struct kvm_hbt_eptp_probe *req)
 		goto fail;
 	}
 	for (i = 0; i < count; i++) {
+		*live_map_slot(p->maps, p->map_index, p->maps[first + i].page) = first + i + 1;
 		for (v = 0; v < 2; v++)
 			*leaves[i].entry[v] = leaves[i].value[v];
 		if (leaves[i].data)
@@ -630,15 +643,6 @@ fail:
 
 /* Bounded, build-local indexes. Values are one-based descriptor/view indices;
  * no hash collision can substitute a different GPA or userspace address. */
-static u16 *update_map_slot(struct kvm_hbt_eptp_live_map *maps, u16 *index, u32 page)
-{
-	unsigned int at = hash_32(page, 10);
-
-	while (index[at] && maps[index[at] - 1].page != page)
-		at = (at + 1) & 1023;
-	return index + at;
-}
-
 static u16 *update_image_slot(struct vmx_hbt_eptp *p, u16 *index, u64 address)
 {
 	unsigned int at = hash_64(address, 11);
@@ -695,7 +699,7 @@ static int update_live(struct vcpu_vmx *vmx, struct kvm_hbt_eptp_probe *req)
 		goto fail;
 	}
 	for (i = 0; i < p->map_count; i++)
-		*update_map_slot(p->maps, indexes, p->maps[i].page) = i + 1;
+		*live_map_slot(p->maps, indexes, p->maps[i].page) = i + 1;
 	for (i = 0; i < count; i++) {
 		struct kvm_hbt_eptp_live_map *m = next->maps + i;
 		u16 *at;
@@ -704,11 +708,11 @@ static int update_live(struct vcpu_vmx *vmx, struct kvm_hbt_eptp_probe *req)
 		if (m->page >= max_pages || m->permissions &
 		    ~(0x707U | KVM_HBT_EPTP_KEEP_NORMAL | KVM_HBT_EPTP_KEEP_HELPER))
 			goto fail;
-		at = update_map_slot(next->maps, indexes + 1024, m->page);
+		at = live_map_slot(next->maps, indexes + 1024, m->page);
 		if (*at)
 			goto fail;
 		*at = i + 1;
-		leaves[i].old = (int)*update_map_slot(p->maps, indexes, m->page) - 1;
+		leaves[i].old = (int)*live_map_slot(p->maps, indexes, m->page) - 1;
 		matched += leaves[i].old >= 0;
 		for (v = 0; v < 2; v++) {
 			unsigned int perm = (m->permissions >> (v * 8)) & 7;
@@ -827,6 +831,7 @@ static int update_live(struct vcpu_vmx *vmx, struct kvm_hbt_eptp_probe *req)
 		for (i = 0; i < p->map_count; i++)
 			free_page((unsigned long)p->map_pages[v][i]);
 	memcpy(p->maps, next->maps, sizeof(p->maps));
+	memcpy(p->map_index, indexes + 1024, sizeof(p->map_index));
 	memcpy(p->map_pages, next->map_pages, sizeof(p->map_pages));
 	p->map_count = count;
 	p->tlb_valid = false;
@@ -865,9 +870,8 @@ static int map_live_data(struct kvm_vcpu *vcpu, struct vmx_hbt_eptp *p,
 		return -EINVAL;
 	if (p->memslots && p->slots_generation != live_slots_generation(vcpu->kvm))
 		return -ESTALE;
-	for (i = 0; i < p->map_count; i++)
-		if (p->maps[i].page == page)
-			return -EPERM;
+	if (*live_map_slot(p->maps, p->map_index, page))
+		return -EPERM;
 	for (i = 0; i < p->data_count; i++)
 		if (p->data_pages[i] == page)
 			return 0;
@@ -899,7 +903,7 @@ static int map_live_data(struct kvm_vcpu *vcpu, struct vmx_hbt_eptp *p,
 static int read_maps(struct vmx_hbt_eptp *p, struct kvm_hbt_eptp_probe *req)
 {
 	struct kvm_hbt_eptp_overlay *maps __free(kfree) = NULL;
-	unsigned int i, j;
+	unsigned int i;
 
 	if (!p || !p->live)
 		return -ENOENT;
@@ -914,12 +918,13 @@ static int read_maps(struct vmx_hbt_eptp *p, struct kvm_hbt_eptp_probe *req)
 		return -EFAULT;
 	for (i = 0; i < req->nr_overlays; i++) {
 		void *page = NULL;
+		unsigned int at;
 
 		if (maps[i].reserved)
 			return -EINVAL;
-		for (j = 0; j < p->map_count; j++)
-			if (p->maps[j].page == maps[i].page)
-				page = p->map_pages[req->view][j];
+		at = *live_map_slot(p->maps, p->map_index, maps[i].page);
+		if (at)
+			page = p->map_pages[req->view][at - 1];
 		if (!page)
 			return -ENOENT;
 		if (copy_to_user(u64_to_user_ptr(maps[i].image_addr), page, PAGE_SIZE))
@@ -962,10 +967,10 @@ static int transfer_ranges(struct vmx_hbt_eptp *p,
 		    (unsigned int)r->offset + r->length > PAGE_SIZE ||
 		    r->image_addr > U64_MAX - r->length)
 			return -EINVAL;
-		for (j = 0; j < p->map_count && p->maps[j].page != r->page; j++)
-			;
-		if (j == p->map_count || !p->map_pages[r->view][j])
+		j = *live_map_slot(p->maps, p->map_index, r->page);
+		if (!j || !p->map_pages[r->view][j - 1])
 			return -ENOENT;
+		j--;
 		if (write && !((p->maps[j].permissions >> (r->view * 8)) & 2))
 			return -EPERM;
 		backing[i] = p->map_pages[r->view][j] + r->offset;
